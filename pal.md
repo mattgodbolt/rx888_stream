@@ -875,6 +875,31 @@ into a tuner designed for analog video (a 1980s/90s PAL TV) and the
 trail vanishes (confirmed by Matt — modern LCD TV via same RF feed
 gives a clean picture).
 
+**IF-position experiment (Day 5).** Captured the same SMS at three
+different R828D IF positions by varying `--frequency` while the SMS
+stayed plugged in:
+
+| `--frequency` request | Vision IF observed | Chroma trail B-energy past red sprite |
+|-----------------------|--------------------|----------------------------------------|
+| 591.2 MHz (default)   | 4.59 MHz           | 4975 (moderate)                        |
+| 590.2 MHz             | 3.59 MHz           | 0 (none detectable)                    |
+| 589.2 MHz             | 2.60 MHz           | 15240 (3× the default)                 |
+
+Trail magnitude **varies by >3× with IF position**, non-monotonically
+(IF 3.59 has *less* trail than the default 4.59, but IF 2.60 has
+much *more*). That rules out simple "worse near band edges". The
+SAW filter's group-delay response has a frequency-specific phase
+ripple; the chroma carrier rides through different parts of it
+depending on where vision is placed in IF.
+
+Crucially: same DSP code, same SMS RF, only the R828D IF position
+differs. **Confirmed: the trail's origin is upstream of
+`demod_real.py`, in the R828D's IF chain.** Specifically the SAW
+filter is the most likely culprit (group-delay distortion of the
+chroma sideband, NOT amplitude rolloff — chroma amplitude was
+similar across positions; only the trail behaviour after sharp
+edges varied).
+
 **Possible software mitigations** (none implemented yet):
 - **Inverse group-delay filter on the IF** in `demod_real.py`.
   Requires measuring the R828D SAW's group-delay curve (e.g. by
