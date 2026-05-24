@@ -819,6 +819,20 @@ explicitly). The standard PAL-B/G/I IF strip includes a sound trap
 *before* the video detector for exactly this reason; a digital
 implementation must mirror this.
 
+**Caveat on the SMS specifically.** This fix actually doesn't help
+the SMS capture — the SMS is **UK PAL-I**, not PAL-B/G, so its sound
+subcarrier sits at vision + **6.0 MHz** (confirmed by FFT of the raw
+cap.bin: clean +63 dB SNR peak at 10.583 MHz against a 4.5922 MHz
+vision carrier — 5.991 MHz offset, ~9 kHz off textbook from the same
+modulator clock drift that makes the line period 64.28 µs). Sound at
++6.0 MHz is already attenuated by `demod_real.py`'s 5.5 MHz LPF to
+40+ dB below chroma in the post-demod CVBS — so it never reached the
+chroma BPF meaningfully. The narrowed BPF dropped the SMS heart-trail
+by only 2.4 %, vs eliminating the hacktv-PAL-B colour-bar ripple
+completely (100 %). The fix is prophylaxis for PAL-B/G captures
+(hacktv default, continental Europe sources); the SMS-specific
+artifact is something else.
+
 ### Type B: SMS heart-trail (UNSOLVED in software)
 
 **Symptom.** The red SMS heart sprite has a ~20-column blue tail
