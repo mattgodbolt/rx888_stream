@@ -227,10 +227,22 @@ white_level = float(np.percentile(frame, 99))
 img = (frame - black_level) / max(white_level - black_level, 1.0) * 255
 img = np.clip(img, 0, 255).astype(np.uint8)
 
+# Resize to 720 wide. Previous integer-factor binning was buggy: with 1248
+# native samples per line and target_w=720, `1248 // 720 = 1` so it
+# truncated to the first 720 samples — losing ~42% on the right.
+# Use PIL's bilinear resize (or skip if it'd actually downsample by an
+# integer factor cleanly, which it won't at 24 MSps active=52µs).
 target_w = 720
-if img.shape[1] > target_w:
-    factor = img.shape[1] // target_w
-    img = img[:, :factor * target_w].reshape(img.shape[0], target_w, factor).mean(axis=2).astype(np.uint8)
+if img.shape[1] != target_w:
+    try:
+        from PIL import Image
+        img = np.asarray(
+            Image.fromarray(img).resize((target_w, img.shape[0]), Image.LANCZOS),
+            dtype=np.uint8,
+        )
+    except ImportError:
+        # No PIL: leave at native width. PGM/PNG both handle wider just fine.
+        pass
 
 ext = dst.rsplit(".", 1)[-1].lower() if "." in dst else "pgm"
 if ext == "pgm":
