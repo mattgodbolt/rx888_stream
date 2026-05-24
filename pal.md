@@ -22,10 +22,22 @@ for any PAL B/G/I source.
 - **Capture:** `rx888_stream vhf -f SDDC_FX3_v22.img -s 24000000
   --frequency 591200000 --vhf-lna 14 --vhf-vga 8 --gain 1
   -o cap.bin`
-- **Decode:** `tools/demod_real.py cap.bin cvbs.s16 --fs 24e6` then
-  `tools/cvbs_to_image_v5.py cvbs.s16 frame.pgm 24e6 22 15556`
-- **Quality:** ~80 dB vision-carrier SNR, decodable monochrome
-  picture. Same as Windows + SDR Console on the same hardware.
+- **Demod:** `tools/demod_real.py cap.bin cvbs.s16 --fs 24e6` (or
+  `--lpf 5.5e6` to preserve chroma for colour decoding)
+- **Decode (monochrome):** `tools/cvbs_to_image_v6.py cvbs.s16
+  frame.png 24e6 0` — clean, TV-style sync separator, full-width
+  output. Produces a recognisable Wonder Boy III gameplay frame.
+- **Decode (colour):** `tools/cvbs_to_image_v8.py cvbs.s16 frame.png
+  24e6 0` — full PAL chroma demod, 1980s-architecture. Uses a fixed
+  textbook fSC, class-aware per-line burst rotation, and auto-detects
+  which line parity is V-inverted. Tested against `hacktv` synthetic
+  colour bars (correct primaries) and the SMS Wonder Boy III capture.
+- **Streaming demod:** `cat cap.bin | python3 tools/demod_stream.py >
+  cvbs.s16` — chunked architecture sketched out for a future C++
+  port; runs at ~0.4× realtime in Python, output bit-equivalent.
+- **Quality:** ~80 dB vision-carrier SNR, fully decodable picture
+  (mono) and reasonable colour. Same SNR as Windows + SDR Console on
+  the same hardware.
 
 ## Full recipe (Linux, from a fresh machine)
 
@@ -355,15 +367,433 @@ The final PAL result passes all three with margin: 221× std ratio on
 SMS-off, line-rate comb that disappears entirely without the source,
 identical carrier position across reproductions.
 
+## Day 3: colour decoding
+
+Goal: decode PAL chroma using only operations a 1980s analog colour TV
+would do — sync separator, burst-locked subcarrier oscillator, Y/C
+separation by frequency, synchronous demodulation, vertical comb
+filter for the Phase Alternating Line trick, YUV → RGB matrix.
+
+### Where we got to
+
+`tools/cvbs_to_image_v7.py` exists and produces colour images. For the
+SMS Wonder Boy III: The Dragon's Trap capture, it shows the right
+*structure* (HUD, brick walls, character sprite, underwater background)
+but the **colours are wrong globally** (hues rotated) and drift
+**across each line** ("yellow bricks come out cyan on the left fading
+to red on the right"). Symptom signature: a frequency error of ~3.8 kHz
+between LO and chroma would explain the per-line drift, but per-burst
+linear fit across the field constrains the residual to ~5 Hz. The
+drift's root cause isn't yet identified.
+
+### Architecture lessons from this attempt (1980s TV ⇒ digital)
+
+- **Sync separator must lowpass chroma first.** v6/v7 originally
+  thresholded the raw CVBS. For a solid-colour test signal that has a
+  strong chroma carrier swinging around the threshold, the slicer fires
+  on every chroma cycle → millions of spurious "pulses". A 1 MHz LPF
+  before threshold makes sync detection robust.
+
+- **Subcarrier "frequency" is a known constant, not a measured peak.**
+  A 1980s TV has a 4.43361875 MHz crystal and a narrowband PLL that
+  pulls the local oscillator's phase to track the burst. v7's initial
+  approach of "find fSC from spectrum peak" worked for the SMS by
+  coincidence; it failed on the BBC where I picked the wrong peak (see
+  below). The right design is: nominal fSC, burst-locked PLL.
+
+- **PAL alternation detection needs care.** Burst phase alternates
+  ±135° in absolute terms per line, but the relationship to a local
+  LO depends on fSC × line_period mod 1. For the SMS this came out to
+  ~91° per line, so naïve `sign(sin(burst_phase))` misclassifies. The
+  workable approach is strict alternation seeded from line 0, but
+  even then we get Hanover-bar artefacts (alternating coloured
+  stripes), suggesting the PAL switch is still being applied wrong on
+  some lines.
+
+- **Visual outputs aren't ground truth from my side.** When showing
+  candidate decodes (rotation sweeps, alternation seeds) I claimed
+  "this one looks right!" multiple times and was wrong every time.
+  Saved as a memory: present candidates with neutral labels and ask
+  rather than declaring.
+
+### BBC Micro test source (Day 3 afternoon)
+
+To get a controlled test signal, we connected a BBC Micro's RF output
+and typed `MODE 2` + a VDU sequence to set the background to a single
+colour (blue, then black, etc). This should give a uniform-colour
+field that's trivially decodable. Several discoveries:
+
+- **BBC modulator is not on a standard UK UHF channel.** It sits at
+  roughly 588 MHz (between Ch 35 = 583.25 and Ch 36 = 591.25). Tuning
+  the RX888 to 591.2 MHz (where the SMS is) lands the BBC vision
+  carrier at 8.16 MHz IF — well past the R828D's SAW filter centre
+  (4.57 MHz) and 4 MHz into the filter rolloff, with vision attenuated
+  to where sync pulses don't clear the noise floor.
+
+- **`demod_real.py`'s carrier auto-detect fails on solid-colour
+  signals.** It picks the strongest narrow peak in 3–6 MHz IF range.
+  For a busy programme (SMS gameplay), vision wins — broad sidebands
+  concentrate energy. For a uniform-colour test pattern, **chroma is
+  a CW tone with all energy in one bin, while vision is spread across
+  its luma sidebands.** Auto-detect grabs chroma; demodulating
+  against chroma gives garbage. Workaround: pass `--carrier`
+  explicitly. Better fix: pick the peak with the strongest
+  line-rate sidebands (vision-only feature).
+
+- **Even after tuning correctly to the BBC, the captured sync
+  pulse-to-black depth is ~⅓ what the SMS gives** (sync_tip –
+  black ≈ 4000 vs 14000 in int16 terms). This is consistent with
+  Matt's observation that the BBC's picture is wobbly and that he
+  has to nudge the TV's tuning to lock it. The signal is intrinsically
+  worse than the SMS; our decoder's sync detection isn't robust
+  enough yet for this regime. A proper TV's sync separator uses
+  hysteresis (Schmitt trigger) and a narrowband PLL on H-sync to lock
+  even when individual sync pulses are weak — we don't.
+
+- **Mono decode of the BBC produces the right *picture content*** (a
+  uniform grey field matching blue's luma, with the BASIC prompt
+  visible in the corner and a black border) but the sync-locked
+  rendering is still flaky — V-sync detection often returns zero
+  runs, requiring careful gain tuning and field selection.
+
+### Open colour issues (where the spike stalled) — now resolved in v8
+
+1. **Per-line hue drift on the SMS** — root cause unknown, ~5 Hz LO
+   residual doesn't explain the magnitude.
+2. **PAL alternation correction** — strict-alternation seed from
+   line 0 still produces stripes; suggests the alternation detection
+   needs to track per-line burst sign rather than assume it.
+3. **`vhs-decode` / `cvbs-decode` as reference** — installed the
+   AppImage but it bails immediately with 0-byte output on both s16
+   and u8 versions of our CVBS, exactly matching what a previous
+   session hit. Not pursued further.
+
+### Day 3 evening: v8 — `hacktv` test source, what was wrong with v7
+
+After hitting a wall trying to diagnose colour against unknown-state
+captures (SMS, BBC), we switched to a known-good synthetic source:
+
+```
+sudo apt install hacktv
+hacktv -m pal -s 24000000 -o file:/tmp/synth_pal_bars.s16 \
+       -t int16 --filter test:colourbars
+```
+
+This emits baseband CVBS at 24 MSps with standard 75 % PAL colour bars
+(grey/yellow/cyan/green/magenta/red/blue) plus a "HACKTV" overlay. It
+feeds straight into the chroma decoder — no IF demod stage needed.
+
+**v7 produced wildly wrong colours even on this clean signal** — a
+"sea of green with a single purple stripe and blue either side" rather
+than a colour-bar spectrum. That proved the bug was in the decoder
+code, not in the capture chain.
+
+A code review against the canonical PAL chroma decoder
+(`simoninns/ld-decode-tools` `palcolour.cpp`, the William Andrew Steer
+implementation) found **six bugs** in v7. In likelihood order:
+
+1. **`fSC` auto-detect picked a chroma sideband, not the subcarrier.**
+   v7 took the largest spectral peak in 4–5 MHz. On colour bars
+   that's dominated by the wide-area chroma U,V components whose
+   sidebands tens of kHz from `fSC` swamp the gated, ~10-cycle burst.
+   v7 settled on 4.45706 MHz, off by ~23 kHz from textbook
+   4.43361875 MHz. A 23 kHz error makes the global LO wind
+   `23 000 × 64 µs × 360° ≈ 530°` per line — about 1¼ turns
+   relative to the true subcarrier. Per-line θ correction only zeros
+   the phase at the back-porch burst; the chroma vector at the right
+   edge of each line has rotated >360° past the compensation. The 1H
+   comb filter then averages this smeared mess across pairs of lines
+   and lands almost everywhere near a single hue.
+
+2. **Per-line rotation θ = φ + 135° was class-blind.** PAL burst sits
+   at `-U+V` (135° in the modulated frame) on V-non-inverted lines and
+   `-U-V` (-135°) on V-inverted lines. The correct LO-vs-subcarrier
+   phase is `ψ = 135° - φ` for the first class and `ψ = -135° - φ`
+   for the second. v7 used `θ = φ + 135°` for both, so half the lines
+   were over-rotated by 270° (=–90°). Combined with the V-flip step,
+   this scrambled U/V on half the lines.
+
+3. **PAL-switch detection was a global parity guess seeded from line
+   zero**, vulnerable to the slow burst-phase wander that bug (1)
+   amplified. The canonical detection compares each line's burst
+   vector to its same-class neighbours (a local dot-product test),
+   which is robust to a wandering global reference.
+
+4. **Two-fold "which class is V-inverted" ambiguity** wasn't resolved
+   at all — v7 just assumed the parity it happened to seed.
+
+5. Burst-phase averaging across class was computed but never used
+   in the actual rotation.
+
+6. U/V scaling was a magic `0.5 / burst_mag` with no calibration
+   to the PAL spec.
+
+### v8 fixes
+
+`tools/cvbs_to_image_v8.py`. Concretely:
+
+- **`fSC` is fixed at the textbook 4.43361875 MHz** (overridable on
+  the CLI but no spectrum-peak heuristic). A 1980s TV uses a crystal,
+  not a spectrum analyser.
+
+- **Per-line ψ is class-aware**: `ψ = 135° - φ` on V-non-inverted
+  lines, `ψ = -135° - φ` on V-inverted lines.
+
+- **The two-fold V-inversion ambiguity is resolved automatically.**
+  The TRUE class assignment makes `ψ_α` and `ψ_β` (averaged over
+  even-index vs odd-index lines) come out essentially equal because
+  the LO-vs-subcarrier phase is a single physical quantity per
+  moment. The wrong assignment makes them 180° apart. v8 picks the
+  hypothesis that minimises `|ψ_α − ψ_β|`.
+
+- **Strict alternation** (every other line is V-inverted) is kept,
+  but the "which parity is V-inverted" is now driven by data via the
+  auto-disambiguation above.
+
+- **V is flipped on V-inverted lines** to recover transmitted V from
+  modulated V (the canonical "PAL switch").
+
+- **U/V scaling** anchored to measured burst magnitude (burst nominal
+  is 0.3 × white-black, so `uv_scale = 0.3 / burst_mag`).
+
+On the `hacktv` colour-bar capture, v8 reports diagnostics like:
+
+```
+fSC = 4.433619 MHz (fixed, textbook)
+α (even-index) burst phase: -89.96°
+β (odd-index)  burst phase:   0.02°
+hyp 1 (α=NTSC, β=PAL): |ψ_α - ψ_β| =   0.02°
+hyp 2 (α=PAL, β=NTSC): |ψ_α - ψ_β| = 179.98°
+→ α is NTSC-style (V not inverted)
+```
+
+i.e. the burst classes are cleanly 90° apart (as expected for PAL
+with this fSC × line ratio), hypothesis 1 is consistent to
+sub-degree, hypothesis 2 is the canonical 180° away. Pixel samples
+from the output: white, yellow, cyan, green, magenta, red, blue
+across the top — the textbook PAL colour bar set.
+
+v8 also decodes the **Sega Master System Wonder Boy III gameplay**
+capture with correct primaries (heart red, potion blue, tile yellow,
+underwater background light blue). The BBC Micro capture still fails
+at the sync-separator stage — that's a separate weak-signal problem,
+not a chroma decode one.
+
+## Gotchas for a C++ port
+
+This section consolidates everything we tripped on, biased toward what
+matters when re-implementing in C++. Each item is what the v8 decoder
+ended up doing and why.
+
+### Subcarrier oscillator
+
+- **`fSC = 4.43361875 MHz` is a constant, not a measurement.** Do
+  NOT find it from a spectrum peak in 4–5 MHz — on real content the
+  largest peak in that band is *chroma sideband energy* (especially
+  for solid-coloured regions or test patterns), not the gated 10-cycle
+  burst. v7 picked 4.45706 MHz, off by ~23 kHz; consequence was the
+  decoder failing catastrophically on all inputs. A real TV uses a
+  4.43361875 MHz crystal; do the same.
+
+- **The LO is continuous across the whole field.** Build `cos(2π fSC
+  · t)` and `sin(2π fSC · t)` once, where `t` runs over the entire
+  capture's sample timeline — *not* reset per line. Burst-locked PLL
+  effects (slow drift between LO and true subcarrier) are handled at
+  the per-line rotation stage, not by re-phasing the LO.
+
+- **A 23 kHz fSC error winds the LO 530° per scanline.** Generally:
+  drift × line_period × 360° per line. So even tiny `fSC` errors are
+  catastrophic — a ~5 Hz residual is the most you can tolerate before
+  per-line correction needs to compensate >1° wind across the line.
+
+### Sync separator
+
+- **Lowpass the CVBS *before* threshold slicing.** A solid-coloured
+  test signal has a CW chroma component swinging through the sync
+  threshold; slicing the raw CVBS gives millions of spurious "pulses"
+  per second from chroma zero-crossings. Use a 1 MHz LPF (e.g. 33-tap
+  FIR Hamming). v7 added this; v6 didn't, and v6 misbehaves on
+  uniform-colour BBC captures.
+
+- **Classify pulses by duration after slicing**, not by edge timing.
+  H-sync ≈ 4.7 µs, broad pulse ≈ 27 µs (or appears as ≈ 59 µs after
+  the LPF smooths over the half-line serrations). V-sync is detected
+  as a *run* of ≥3 broad-pulse pulses within 1.5 line periods.
+
+- **Percentile-based slicer threshold works.** `sync_tip =
+  P(0.5%)`, `black = P(30%)`, `thr = (sync_tip + black)/2`.
+  Assumes some sync content in the buffer — fine for a real-time
+  decoder that processes ≥1 frame.
+
+- **Weak-signal sync is fragile.** A proper TV uses a Schmitt-trigger
+  slicer with hysteresis plus a narrowband PLL on H-sync to lock
+  through individual missing or weak pulses. We don't — and that's
+  why our BBC capture (sync depth ~3 % of full scale, vs ~15 % for
+  SMS) fails at sync detection. Worth implementing properly in C++.
+
+### Burst detection and per-line rotation
+
+- **Burst sits in the back porch**, ~5.4–7.9 µs after the H-sync
+  edge. About 10 cycles of `fSC`. Measure its (cos, sin) projections
+  against the global LO (i.e. integrate `raw_U_full` and `raw_V_full`
+  over the burst window).
+
+- **Burst phase alternates by ±90° in the local LO frame**, not
+  ±180°. The transmitted burst alternates between `-U+V` (135° in the
+  modulated frame, "NTSC-style line") and `-U-V` (-135°,
+  "PAL-style line"). After mixing with our LO at unknown phase ψ,
+  the burst phases are:
+    - NTSC line: `φ = 135° − ψ`
+    - PAL line:  `φ = −135° − ψ`
+  Difference: `Δφ = 270°` modulo 360° = ±90° depending on convention.
+  This explains the diagnostic `delta: ~90°` (or `-90°`) you'll see
+  between the two line classes.
+
+- **Per-line rotation must be class-aware.** Recovery formula:
+    - NTSC line: `ψ = 135° − φ`
+    - PAL line:  `ψ = −135° − φ`
+  Then `(U_tx, V_mod) = R(+ψ) · (raw_U, raw_V)`, i.e.
+    ```
+    U     =  cos ψ · raw_U − sin ψ · raw_V
+    V_mod =  sin ψ · raw_U + cos ψ · raw_V
+    ```
+  v7 used `ψ = φ + 135°` for all lines — that's correct for one
+  class but 90° off for the other.
+
+- **V flip on PAL-style lines** to recover transmitted V from
+  modulated V: `V_tx = -V_mod` on PAL-style lines.
+
+- **The 2-fold "which parity is V-inverted" ambiguity** is intrinsic
+  — from a cold start, you can't tell which line was the first
+  NTSC-style burst. v8 picks the hypothesis that minimises
+  `|ψ_α − ψ_β|`: the *true* hypothesis gives both classes the same
+  underlying ψ (it's a single physical LO-vs-subcarrier offset); the
+  *wrong* hypothesis makes them appear 180° apart.
+
+- **Self-consistency check is also a confidence indicator.** On
+  clean signals you get `|ψ_α − ψ_β|` well under 2° for the right
+  hypothesis and ~180° for the wrong one. Anywhere between (say 30°
+  and 150°) means burst SNR is too low to trust the decision and
+  the C++ port should emit a warning or fall back to a previous
+  class-assignment guess.
+
+- **Comb filter (1H delay average) on U, V** is applied *after* the
+  V-flip, so adjacent lines now agree in V sign and direct averaging
+  is correct: `U_comb[n] = (U[n] + U[n-1]) / 2`.
+
+### Y/C separation
+
+- **Frequency-based, not comb-based, in v8.** Y is LPF below 3 MHz;
+  C is BPF 3.5–5.5 MHz around `fSC`. 65-tap Hamming-window FIR is
+  enough at 24 MSps. A real 1980s set used L/C resonant networks or
+  glass delay-line comb filters; for our purposes the frequency-based
+  split is fine and trivially portable to C++.
+
+- **Y BPF leakage is the main residual artifact.** Chroma at 4.43 MHz
+  leaks into a 3 MHz Y LPF (rolloff finite, especially with a 65-tap
+  Hamming → ~30 dB stopband attenuation). Result: chroma appears as
+  Y modulation, visible as "dot crawl" on high-saturation edges. A
+  PAL comb filter for Y/C separation would do better but isn't yet
+  implemented.
+
+### Levels and scaling
+
+- **Negative modulation on PAL B/G/I.** Sync tip is the *peak* RF
+  carrier amplitude after AM envelope detection; the envelope must be
+  inverted before sync slicing / sync detection. (Done in
+  `demod_real.py`, line `out = (peak − env) / span`.)
+
+- **Burst amplitude is 0.3 × white-to-blanking** in PAL. After the
+  factor-of-½ from synchronous demod (cos·cos LPF gives ½ cos Δφ),
+  `burst_mag = burst_amplitude / √2 ≈ 0.15 × luma_range`. v8 uses
+  `uv_scale = 0.3 / burst_mag`, which empirically gives roughly the
+  right saturation on 75 % colour bars. A theoretically-anchored
+  scaling would also account for the BT.601 max-U/V scaling factors
+  (0.493 for U, 0.877 for V) and the burst-vector magnitude `√2`
+  factor.
+
+- **YUV → RGB uses BT.601 coefficients** (PAL is covered by BT.601
+  alongside NTSC; they share the matrix).
+
+### Capture-chain reminders
+
+- **TUNERINIT must pass the ADC frequency**, not 0, on the third
+  `rx888_send_command(STARTADC)`. This is the fix in PR #16 — without
+  it, the R828D's LO ends up wandering and reception is unusable.
+
+- **`demod_real.py`'s carrier auto-detect** picks the strongest narrow
+  peak in 3–6 MHz IF. Fine for busy programme content (vision wins via
+  broad sidebands), broken for uniform-colour test signals (chroma
+  wins as a CW tone). For solid-colour testing, pass `--carrier
+  4.57e6` explicitly. For the C++ port, prefer picking the peak with
+  the strongest *line-rate* (15.625 kHz) sideband structure — that's
+  the vision-only signature.
+
+## Chroma "echoes" / trailing artifacts
+
+Even after v8 decodes the SMS gameplay frame with correct primaries,
+there's a visible *afterimage* after sharp coloured edges (e.g. a
+ghost of the heart sprite trailing to its right). Theories, in
+descending plausibility:
+
+1. **Chroma BPF impulse-response ringing.** The 3.5–5.5 MHz BPF (65
+   taps at 24 MSps) has an impulse response that decays over ~30
+   samples at the subcarrier centre frequency. After a sharp colour
+   transition (e.g. the heart-to-background edge), the BPF output
+   rings for ≈1.25 µs = ≈7–8 visible pixels of trailing colour.
+   This matches the visual signature precisely. **Cure:** use a
+   sharper or comb-based Y/C separator. A 1H delay-line comb
+   (subtract adjacent lines to cancel C, average to keep Y) is the
+   1980s standard for clean Y/C separation without BPF artifacts.
+
+2. **Y/C cross-talk in the Y LPF.** Chroma at 4.43 MHz isn't fully
+   attenuated by a 3 MHz Y LPF (Hamming-window 65-tap gives ~30 dB
+   stopband, so chroma leaks at ~3 % into Y). On a coloured sprite
+   edge, the Y output briefly modulates from chroma, then settles —
+   another contributor to the ghost. **Cure:** same as above
+   (notch out fSC ± 0.5 MHz from Y, or use comb).
+
+3. **U/V LPF response.** The 1.5 MHz LPF on the demodulated U,V
+   channels has its own group delay (~32 samples = 1.3 µs at
+   24 MSps); compared to the Y LPF's similar delay this should
+   *match* and not cause offset, but the impulse-response tail of
+   the U/V LPF independently smears chroma transitions over ~5–7
+   pixels. Likely a smaller contributor than (1) but additive.
+
+4. **AM-to-PM conversion in the R828D tuner front end.** Real-world
+   tuners with AGC or saturation effects convert AM (luma) into PM
+   on the chroma carrier — a known SDR-PAL gotcha. The signature is
+   chroma misregistration after sharp luma edges. We have no
+   evidence one way or the other on whether the R828D does this
+   noticeably; would need to compare against a baseband CVBS
+   capture from a real PAL decoder (e.g. through a video capture
+   card) to know.
+
+5. **Reflections in the SMS RF modulator → coax → SDR path.**
+   ~10 cm of cable means any reflection echoes are sub-nanosecond
+   and wouldn't show as multi-pixel ghosts. Almost certainly not
+   this.
+
+For the C++ port, the cleanest fix is a Y/C separator built around a
+1-line delay comb: `Y_clean = (Y[n] + Y[n-1])/2 + Y_high_pass_lr`,
+`C_clean = (Y[n] - Y[n-1])/2` followed by demodulation. That removes
+both (1) and (2) at the cost of vertical resolution loss on
+high-frequency vertical chroma transitions — the canonical PAL
+trade-off, which real TVs accepted.
+
 ## What does and doesn't work
 
 | Path | Status |
 |------|--------|
 | Windows + ExtIO_sddc + VHF + SMS at 591.2 MHz | ✅ ~70 dB SNR, full PAL visible |
-| Linux + `rx888_stream` *with [PR #16](https://github.com/rhgndf/rx888_stream/pull/16)* + SDDC_FX3_v22.img + SMS at 591.2 MHz | ✅ ~80 dB SNR, full PAL + line-rate comb, decodes |
+| Linux + `rx888_stream` *with [PR #16](https://github.com/rhgndf/rx888_stream/pull/16)* + SDDC_FX3_v22.img + SMS at 591.2 MHz **mono** | ✅ ~80 dB SNR, decodable Wonder Boy III frame |
+| Linux + `rx888_stream` *with PR #16* + SMS at 591.2 MHz **colour** | ✅ v8 decoder; verified end-to-end against `hacktv` colour bars |
+| Linux + `rx888_stream` + BBC Micro (~588 MHz tune) **mono** | ⚠️ Picture structure visible, sync detection fragile |
+| Linux + `rx888_stream` + BBC Micro **colour** | ❌ Junk output |
 | Linux + `rx888_stream` *`rhgndf` main, no PR #16* + any firmware + SMS at 591.2 MHz | ❌ wandering weak carrier, no decodable picture |
 | Linux + `rx888_stream` + HF + AM broadcast | ✅ works with a wire antenna |
 | Linux + `rx888_stream` + official v1.3.0RC1 firmware blob | ❌ `Transfer failed: PollTimeout` — pre-#225 firmware speaks a different USB protocol |
+| `cvbs-decode` (AppImage) on our CVBS | ❌ 0-byte output, exits with "saving JSON" without decoding |
 
 ## File map
 
@@ -373,9 +803,26 @@ identical carrier position across reproductions.
   (this script).
 - `tools/demod_iq_wav.py` — same idea but for an SDR Console IQ WAV
   input (carrier already centered at 0 Hz).
-- `tools/cvbs_to_image_v5.py` — baseband CVBS → PGM still. Single
+- `tools/cvbs_to_image_v5.py` — baseband CVBS → PGM/PNG still. Single
   field, doubled vertically, back-porch DC reference. Optional
   line-rate-Hz override (5th positional arg).
+- `tools/cvbs_to_image_v6.py` — same idea but with a TV-style sync
+  separator (slicer + duration-classified pulses → broad-pulse-run
+  V-sync, per-line H-sync anchor). Produces full-width frames.
+  Recommended over v5 for monochrome rendering of clean signals.
+- `tools/cvbs_to_image_v7.py` — first colour decoder attempt. Had six
+  bugs (notably: auto-detecting fSC from spectrum peak, class-blind
+  per-line rotation). Kept for historical reference. **Use v8 for
+  colour.**
+- `tools/cvbs_to_image_v8.py` — current colour decoder. Fixed fSC at
+  textbook 4.43361875 MHz, class-aware per-line burst rotation, and
+  auto-resolves the 2-fold V-inversion ambiguity by picking the
+  self-consistent hypothesis. Tested against `hacktv -m pal --filter
+  test:colourbars` synthetic source (decoded primaries match).
+- `tools/demod_stream.py` — chunked streaming demod sketched out as
+  the architecture an eventual C++ port would use. Reads raw int16
+  from stdin, writes baseband CVBS at 8 MSps (decimated 3×) to
+  stdout. Runs at ~0.4× realtime in Python on a 5.9 s capture.
 - `tools/cvbs_to_image{.py,_simple.py,_v3.py,_v4.py}` — older
   variants kept for reference.
 - `tools/live_scope.py` — live multi-pane scope (RF spectrum +
@@ -411,6 +858,28 @@ identical carrier position across reproductions.
 - Different physical USB ports — irrelevant; USB 2 high-speed and
   USB 3 SuperSpeed both work fine.
 
+## Streaming demod (sketch for C++ port)
+
+`tools/demod_stream.py` is the architecture sketch. It reads chunks
+from stdin (default 0.25 s = 6 M samples at 24 MSps), processes each
+chunk via a continuous-LO NCO mixer, overlap-save FIR LPF (scipy
+`oaconvolve`) with built-in 3× decimation, envelope detect, and
+inversion, and writes CVBS chunks to stdout. State carried between
+chunks: cumulative sample index (for phase continuity), overlap tail
+for the FIR, EMA-tracked peak/floor for inversion scaling.
+
+Pure-Python throughput on a 5.93 s capture (after preallocating
+buffers): **~14 s wall = 0.42× realtime**. The work breakdown is
+mostly `oaconvolve` doing FFT convolution.
+
+The structure maps directly to a C++ port: a fixed set of ring
+buffers, a precomputed FIR coefficient table, an NCO step multiplier
+for the LO. No per-frame malloc. C++ wins come from removing Python
+per-call overhead and fusing the mix+filter+envelope into a single
+loop — numpy already uses SIMD via libmvec/BLAS, so the gain isn't
+SIMD-vs-no-SIMD but eliminating numpy bookkeeping and intermediate
+buffers.
+
 ## Open follow-ups
 
 - **[Issue #15](https://github.com/rhgndf/rx888_stream/issues/15) /
@@ -434,3 +903,21 @@ identical carrier position across reproductions.
   /sys/bus/usb/devices/2-1/authorized; sleep 1; echo 1 | sudo tee
   /sys/bus/usb/devices/2-1/authorized`) or physical replug. Probably
   a missing `STOPFX3` on signal-driven exit — worth tracking down.
+- **Colour decoder** — v8 supersedes v7 and produces correct
+  primaries on the `hacktv` synthetic test source. Per-line hue
+  drift seen in v7 is resolved (root cause was an off-by-23-kHz
+  `fSC`). Remaining polish: confidence-thresholded auto-disambiguation,
+  median-smoothing of per-line burst phase, full interlace, BBC
+  capture decoding (needs sync separator hardening).
+- **`demod_real.py` carrier auto-detect**: picks the strongest
+  narrow peak in 3–6 MHz IF. Works for typical content (vision
+  carrier wins) but fails for solid-colour test signals where
+  chroma is a stronger CW tone. Should select the peak with the
+  strongest line-rate sideband structure instead — that's the
+  vision-only signature.
+- **Sync separator robustness**: v6's slicer-on-raw-CVBS fires on
+  chroma cycles when chroma is present in the demod output. v7
+  added a 1 MHz LPF before slicing; v6 should get the same fix.
+  Sync detection still fragile on weak captures (BBC); a proper TV
+  uses hysteresis + a PLL on H-sync to lock through weak pulses,
+  we don't.
