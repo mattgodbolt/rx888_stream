@@ -31,7 +31,7 @@ know the carrier is somewhere else.
 """
 import argparse, sys
 import numpy as np
-from scipy.signal import firwin, lfilter
+from scipy.signal import firwin, oaconvolve
 
 
 def main():
@@ -88,15 +88,27 @@ def main():
         fc = float(args.carrier)
         print(f"using --carrier {fc/1e6:.4f} MHz", file=sys.stderr)
 
-    # Downconvert to baseband: multiply by exp(-j 2pi fc n / fs)
+    # Downconvert to baseband: multiply by exp(-j 2pi fc n / fs).
+    # Phase MUST be float64 — at ~5 MHz carrier × 100M+ samples, the
+    # accumulated phase reaches ~1.7e8 radians, which exceeds float32
+    # mantissa precision (only 7 decimal digits) and degenerates to
+    # noise. cos/sin themselves can return float32 to save memory.
     print("downconverting...", file=sys.stderr)
-    phase = -2 * np.pi * fc / fs * np.arange(len(x), dtype=np.float64)
-    bb = x.astype(np.complex64) * np.exp(1j * phase).astype(np.complex64)
+    phase = (-2 * np.pi * fc / fs) * np.arange(len(x), dtype=np.float64)
+    lo_r = np.cos(phase).astype(np.float32)
+    lo_i = np.sin(phase).astype(np.float32)
+    del phase
+    bb_r = x * lo_r
+    bb_i = x * lo_i
+    del lo_r, lo_i
 
+    # FIR low-pass via overlap-add FFT convolution: O(N log N) rather than
+    # lfilter's O(N × taps). On 100M+ samples that's typically 10× faster.
     print(f"LPF to {args.lpf/1e6:g} MHz ({args.ntap} taps)...", file=sys.stderr)
     lpf = firwin(args.ntap, args.lpf / (fs / 2), window="hamming").astype(np.float32)
-    I = lfilter(lpf, [1.0], bb.real).astype(np.float32)
-    Q = lfilter(lpf, [1.0], bb.imag).astype(np.float32)
+    I = oaconvolve(bb_r, lpf, mode='same').astype(np.float32)
+    Q = oaconvolve(bb_i, lpf, mode='same').astype(np.float32)
+    del bb_r, bb_i
 
     env = np.sqrt(I*I + Q*Q).astype(np.float32)
     print(f"envelope: mean={env.mean():.0f} std={env.std():.0f} "
