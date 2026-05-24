@@ -27,11 +27,19 @@ for any PAL B/G/I source.
 - **Decode (monochrome):** `tools/cvbs_to_image_v6.py cvbs.s16
   frame.png 24e6 0` — clean, TV-style sync separator, full-width
   output. Produces a recognisable Wonder Boy III gameplay frame.
-- **Decode (colour):** `tools/cvbs_to_image_v8.py cvbs.s16 frame.png
-  24e6 0` — full PAL chroma demod, 1980s-architecture. Uses a fixed
-  textbook fSC, class-aware per-line burst rotation, and auto-detects
-  which line parity is V-inverted. Tested against `hacktv` synthetic
-  colour bars (correct primaries) and the SMS Wonder Boy III capture.
+- **Decode (colour):** `tools/cvbs_decode.py cvbs.s16 frame.png` —
+  full PAL chroma demod, 1980s-architecture. Uses a fixed textbook
+  fSC, class-aware per-line burst rotation, and auto-detects which
+  line parity is V-inverted. Tested against `hacktv` synthetic colour
+  bars (correct primaries) and the SMS Wonder Boy III capture.
+  Options:
+    - `--yc-mode {bpf,comb}` — Y/C separator. `comb` is default and
+      avoids BPF impulse-response ringing; `bpf` is the
+      frequency-split mode used in earlier iterations.
+    - `--mono` — skip chroma processing (debug).
+    - `--debug` — print burst-after-rotation sanity check.
+    - `--field N` — which detected V-sync to anchor on.
+    - `--fsc HZ` — override textbook subcarrier (e.g. for non-B/G PAL).
 - **Streaming demod:** `cat cap.bin | python3 tools/demod_stream.py >
   cvbs.s16` — chunked architecture sketched out for a future C++
   port; runs at ~0.4× realtime in Python, output bit-equivalent.
@@ -530,7 +538,7 @@ implementation) found **six bugs** in v7. In likelihood order:
 
 ### v8 fixes
 
-`tools/cvbs_to_image_v8.py`. Concretely:
+`tools/cvbs_decode.py`. Concretely:
 
 - **`fSC` is fixed at the textbook 4.43361875 MHz** (overridable on
   the CLI but no spectrum-peak heuristic). A 1980s TV uses a crystal,
@@ -683,18 +691,38 @@ ended up doing and why.
 
 ### Y/C separation
 
-- **Frequency-based, not comb-based, in v8.** Y is LPF below 3 MHz;
-  C is BPF 3.5–5.5 MHz around `fSC`. 65-tap Hamming-window FIR is
-  enough at 24 MSps. A real 1980s set used L/C resonant networks or
-  glass delay-line comb filters; for our purposes the frequency-based
-  split is fine and trivially portable to C++.
+- **Two implementations.** `cvbs_decode.py --yc-mode bpf` (default) is
+  the frequency split: Y = LPF 3 MHz, C = BPF **3.5–5.0 MHz**.
+  `--yc-mode comb` is a 2-line delay-line comb:
+  `Y = (x + x_2H)/2`, `C = (x - x_2H)/2`. See "What `--yc-mode comb`
+  actually does, and why 2H not 1H" below for the trade-off.
 
-- **Y BPF leakage is the main residual artifact.** Chroma at 4.43 MHz
-  leaks into a 3 MHz Y LPF (rolloff finite, especially with a 65-tap
-  Hamming → ~30 dB stopband attenuation). Result: chroma appears as
-  Y modulation, visible as "dot crawl" on high-saturation edges. A
-  PAL comb filter for Y/C separation would do better but isn't yet
-  implemented.
+- **C BPF upper cutoff is 5.0 MHz, NOT 5.5 MHz.** PAL-B/G FM sound
+  subcarrier is at vision+5.5 MHz. If the BPF upper edge sits at
+  5.5 MHz, sound leaks through, beats with the chroma LO down to
+  1.07 MHz, and lands inside the UV LPF passband as ~13-col-spaced
+  ripples in solid-coloured regions. Confirmed by toggling
+  `hacktv --noaudio` (ripples vanish entirely). The chroma signal
+  itself only extends ~±1.5 MHz around fSC anyway, so 5.0 MHz is a
+  generous upper cutoff without touching real chroma content.
+
+- **BPF impulse response also rings after sharp coloured edges.**
+  A 65-tap linear-phase BPF rings symmetrically; `--chroma-phase
+  minimum` (default) removes the pre-cursor but the post-cursor
+  energy is similar. Comb mode avoids BPF ringing entirely (but
+  see comb mode's vertical-detail cost below).
+
+- **Comb mode cost: vertical-detail leakage from Y into C.** Where
+  picture brightness changes line-to-line, the comb's luma
+  cancellation breaks down and luma residue shows up as a coloured
+  fringe at horizontal edges. The canonical PAL Y/C trade-off; real
+  TVs accepted it. Late-1980s+ sets used adaptive combs (switch
+  between BPF and comb based on detected vertical detail).
+
+- **BPF-mode Y LPF leakage is a smaller artifact.** Chroma at
+  4.43 MHz leaks into a 3 MHz Y LPF (~30 dB stopband attenuation
+  with 65-tap Hamming → ~3 % chroma leakage). Visible as "dot crawl"
+  on high-saturation edges in BPF mode only.
 
 ### Levels and scaling
 
@@ -729,57 +757,271 @@ ended up doing and why.
   the strongest *line-rate* (15.625 kHz) sideband structure — that's
   the vision-only signature.
 
-## Chroma "echoes" / trailing artifacts
+## Chroma "echoes" / trailing artifacts — the long investigation
 
-Even after v8 decodes the SMS gameplay frame with correct primaries,
-there's a visible *afterimage* after sharp coloured edges (e.g. a
-ghost of the heart sprite trailing to its right). Theories, in
-descending plausibility:
+The SMS gameplay frame decodes with correct primaries, but it has
+visible artifacts of two distinct kinds. I spent a *lot* of time
+conflating them. Documenting separately here:
 
-1. **Chroma BPF impulse-response ringing.** The 3.5–5.5 MHz BPF (65
-   taps at 24 MSps) has an impulse response that decays over ~30
-   samples at the subcarrier centre frequency. After a sharp colour
-   transition (e.g. the heart-to-background edge), the BPF output
-   rings for ≈1.25 µs = ≈7–8 visible pixels of trailing colour.
-   This matches the visual signature precisely. **Cure:** use a
-   sharper or comb-based Y/C separator. A 1H delay-line comb
-   (subtract adjacent lines to cancel C, average to keep Y) is the
-   1980s standard for clean Y/C separation without BPF artifacts.
+- **Type A — ripples within a uniform colour**: a uniformly-coloured
+  region (e.g. a solid red bar) has periodic chroma artifacts at
+  ~13-column spacing in the output. *Cause: PAL-B sound subcarrier
+  leakage. Solved.*
+- **Type B — sustained colour trail past a sharp coloured edge**: e.g.
+  the SMS heart sprite has a ~20-column blue tail past its right
+  edge. *Cause: upstream of our DSP, almost certainly R828D SAW
+  filter group-delay distortion. Not solved in software.*
 
-2. **Y/C cross-talk in the Y LPF.** Chroma at 4.43 MHz isn't fully
-   attenuated by a 3 MHz Y LPF (Hamming-window 65-tap gives ~30 dB
-   stopband, so chroma leaks at ~3 % into Y). On a coloured sprite
-   edge, the Y output briefly modulates from chroma, then settles —
-   another contributor to the ghost. **Cure:** same as above
-   (notch out fSC ± 0.5 MHz from Y, or use comb).
+### Type A: PAL-B sound carrier leakage (FIXED)
 
-3. **U/V LPF response.** The 1.5 MHz LPF on the demodulated U,V
-   channels has its own group delay (~32 samples = 1.3 µs at
-   24 MSps); compared to the Y LPF's similar delay this should
-   *match* and not cause offset, but the impulse-response tail of
-   the U/V LPF independently smears chroma transitions over ~5–7
-   pixels. Likely a smaller contributor than (1) but additive.
+**Symptom.** On a solid red bar that should decode to `(255, 0, 0)`,
+the output has a periodic ripple of `(208, 0, 73)`→`(255, 0, 0)`
+every ~13 PNG columns (at 720 active columns).
 
-4. **AM-to-PM conversion in the R828D tuner front end.** Real-world
-   tuners with AGC or saturation effects convert AM (luma) into PM
-   on the chroma carrier — a known SDR-PAL gotcha. The signature is
-   chroma misregistration after sharp luma edges. We have no
-   evidence one way or the other on whether the R828D does this
-   noticeably; would need to compare against a baseband CVBS
-   capture from a real PAL decoder (e.g. through a video capture
-   card) to know.
+**Diagnostic methodology — the right way to isolate.** Don't iterate
+against the SMS capture (state unknown). Use `hacktv` to synthesise
+a known-good VSB-modulated PAL-B IQ signal, then run it through the
+same demod + decode chain. If the synthetic gives the same artifact,
+the cause is in our DSP. Then toggle hacktv options one at a time to
+isolate which input feature triggers it.
 
-5. **Reflections in the SMS RF modulator → coax → SDR path.**
-   ~10 cm of cable means any reflection echoes are sub-nanosecond
-   and wouldn't show as multi-pixel ghosts. Almost certainly not
-   this.
+That's how this was found: `hacktv -m b -s 24e6 --filter test:colourbars`
+produced the ripple. `hacktv ... --noaudio test:colourbars` (same
+everything else, but with the audio subcarrier disabled) produced a
+perfectly clean output — red bar B-channel std went `29.57 → 0.00`,
+min R `206 → 255`. Confirmed in one command.
 
-For the C++ port, the cleanest fix is a Y/C separator built around a
-1-line delay comb: `Y_clean = (Y[n] + Y[n-1])/2 + Y_high_pass_lr`,
-`C_clean = (Y[n] - Y[n-1])/2` followed by demodulation. That removes
-both (1) and (2) at the cost of vertical resolution loss on
-high-frequency vertical chroma transitions — the canonical PAL
-trade-off, which real TVs accepted.
+**Mechanism.** PAL B/G has an FM sound subcarrier at *vision +
+5.5 MHz*. Our IF LPF in `demod_real.py` is at 5.5 MHz, so sound
+leaks through partially. After envelope-detection it appears in the
+baseband CVBS at a 5.5 MHz beat frequency.
+
+Then in `cvbs_decode.py`:
+1. Chroma BPF originally `3.5–5.5 MHz`. **Sound is right at the
+   upper passband edge — passes through.**
+2. Synchronous demod against fSC = 4.43 MHz. Sound at 5.5 MHz beats
+   down to `5.5 − 4.43 = 1.07 MHz`.
+3. UV LPF at 1.5 MHz. **1.07 MHz is inside the passband. Sound now
+   appears as a 1.07 MHz signal in U,V.**
+
+At 720 active columns and active line ≈ 52 µs, a 1.07 MHz signal
+shows as `1.07e6 × 52e-6 ≈ 55.6 cycles per active line ÷ 720 cols ≈
+13 cols per cycle`. Matches the observed ripple period exactly.
+
+**Fix.** Narrowed the chroma BPF upper cutoff from 5.5 MHz to
+**5.0 MHz** in `cvbs_decode.py`. Sound at 5.5 MHz now has the BPF's
+stopband attenuation against it. Ripples go to zero on the synthetic
+test case, and the SMS capture's solid-colour regions clean up.
+
+**Lesson for the C++ port.** **Don't put the chroma BPF upper cutoff
+at the sound carrier frequency.** Use 5.0 MHz (or notch out sound
+explicitly). The standard PAL-B/G/I IF strip includes a sound trap
+*before* the video detector for exactly this reason; a digital
+implementation must mirror this.
+
+### Type B: SMS heart-trail (UNSOLVED in software)
+
+**Symptom.** The red SMS heart sprite has a ~20-column blue tail
+extending past its right edge. The trail's peak is ~30% of the
+heart's own chroma magnitude; it decays gradually.
+
+**Things ruled out** (by careful experiments, not guessing):
+
+- **Chroma BPF linear-phase pre-cursor ringing.** Implemented
+  minimum-phase BPF (`--chroma-phase minimum`). Pre-cursor blue tint
+  is technically gone but total trail energy past the heart unchanged
+  (-2%). The trail's energy is structural, not pre-ringing.
+- **VSB quadrature distortion** (`Q²/(2I)` self-product in envelope
+  detection of vestigial-sideband AM — Bluestein 1979). Tested with
+  synthetic VSB + synchronous demod vs envelope. Both gave **identical**
+  output. The Q² hypothesis was wrong as the dominant cause for *this*
+  artifact — although it's a real effect, it's small at ~10 % of the
+  observed magnitude and would manifest as a luma-band error, not a
+  chroma-band trail.
+- **PAL-B sound carrier** (the Type A cause). Narrowing the BPF
+  reduced the SMS trail by only -2.4 %, vs eliminating the colour-bar
+  ripple by 100 %. Different artifacts.
+- **Y/C cross-talk in the Y LPF.** Not the dominant contributor —
+  the trail is in the chroma, not in the luma, and the luma path is
+  dead-flat through the trail zone.
+- **Our DSP chain in general.** `hacktv` VSB-modulated input through
+  the *same* `demod_real.py` + `cvbs_decode.py` pipeline produces
+  zero trail past a sharp bar transition. The pipeline itself is
+  faithful.
+
+**Where it must be.** Upstream of `demod_real.py`, since the trail's
+energy is present in the demoded CVBS that `cvbs_decode.py` ingests
+(measured by Hilbert-transform envelope of the chroma BPF output;
+real chroma energy extends ~25 columns past the heart's right edge).
+This points at the RF capture path — most likely **R828D tuner SAW
+filter group-delay distortion** at chroma frequencies. The R828D is
+a silicon DVB-T/C tuner; its SAW is designed for digital reception
+where group-delay flatness isn't the priority. Plug the same SMS RF
+into a tuner designed for analog video (a 1980s/90s PAL TV) and the
+trail vanishes (confirmed by Matt — modern LCD TV via same RF feed
+gives a clean picture).
+
+**Possible software mitigations** (none implemented yet):
+- **Inverse group-delay filter on the IF** in `demod_real.py`.
+  Requires measuring the R828D SAW's group-delay curve (e.g. by
+  capturing a wideband chirp through the same setup) and designing
+  an FIR/IIR that pre-distorts to flatten it.
+- **Per-frequency phase compensation in chroma demod.** If the
+  chroma's group delay is known, a constant phase offset to
+  per-line ψ would correct the average misregistration but not the
+  trail itself.
+
+**Hardware mitigations** (with access to the device):
+- Try a different SDR + tuner combination.
+- Bypass the R828D's SAW and tap the I/Q signal earlier in its path.
+
+**Lesson for the C++ port.** Don't expect to debug this kind of
+hardware-induced artifact by tweaking decoder code. Build the
+*synthetic input test* into the toolchain from day one — if you can
+push known-clean signals through the decoder and see clean output,
+you've proved the decoder is faithful. Anything left over is upstream.
+
+### Gotcha: minimum-phase vs linear-phase chroma BPF
+
+A real 1980s analog chroma trap (the LC tank that separated chroma
+from luma in BPF-mode receivers) is **causal by physics** — current
+flows in time order, capacitors charge after they're driven, not
+before. That means it's **minimum-phase**: no pre-cursor response, no
+energy before t=0.
+
+Naively-designed digital FIRs are *linear-phase* by default
+(symmetric impulse response). On a sharp coloured edge, a
+linear-phase BPF rings symmetrically — energy spreads both **before**
+and **after** the edge. The "before" part is the *pre-echo*: in our
+SMS Wonder Boy decode it manifests as a faint blue tint extending
+~30 columns *to the left* of the red heart sprite (B≈5-18 counts vs
+0 background). This is purely a digital-filter artifact; no analog
+TV ever had it.
+
+`cvbs_decode.py --chroma-phase minimum` (default) converts the
+linear-phase Hamming-window BPF to its minimum-phase equivalent via
+`scipy.signal.minimum_phase`. Same magnitude response. Result on
+the SMS:
+- Pre-cursor blue tint **gone**.
+- Leading edge of red sprite goes from a 6-column gradual ramp to
+  a 2-column sharp step.
+- Trailing blue echo (the chroma BPF's step-response overshoot into
+  the opposite chroma direction) is ~10% shorter but peak intensity
+  similar — that energy got moved earlier rather than eliminated.
+
+For a C++ port, two options: (a) build a minimum-phase FIR directly
+via Hilbert-transform decomposition / homomorphic filtering (what
+`scipy.signal.minimum_phase` does); (b) use an IIR biquad chroma
+trap — naturally minimum-phase. (b) is closer to what the 1980s TV
+actually had and is cheaper to compute, but harder to specify a
+clean stopband. (a) is what we did.
+
+### Gotcha: 1980s TVs used a FIXED 2H delay — and that breaks on
+### cheap modulators
+
+A real 1980s PAL TV's comb filter (when it had one — many home sets
+just used a BPF/trap) was a **glass ultrasonic delay line**,
+mechanically cut to one 1H delay (~64 µs). Some higher-end sets used
+two 1H lines stacked for a 2H delay (~128 µs).
+
+These delays were **fixed**. There was no adjustment for source clock
+drift, because **broadcast PAL was stable to single-ppm tolerance** —
+the network/studio reference clocks didn't drift enough to matter.
+
+**Cheap consumer modulators (early home computers, game consoles)
+were not.** The SMS RF modulator runs at 64.28 µs per line — 0.4 %
+off from spec. That's enormous by broadcast standards. Plug an SMS
+into a 1980s comb-filter TV and you'd see:
+
+- Y/C cancellation in Y degraded (chroma carrier rides through into
+  Y as horizontal striping / dot crawl).
+- Luma in C misaligned line-to-line, smearing chroma horizontally.
+
+Most 1980s home TVs used a simple BPF/trap (no comb), so what users
+actually saw on SMS-via-RF was dot crawl on coloured edges — the
+"BPF impulse-response echoes" we see in `--yc-mode bpf`.
+
+**`cvbs_decode.py` auto-measures the line period** from H-sync gaps
+and uses `2 × measured` for the comb delay. This is more sophisticated
+than a 1980s TV would do, but it's the right move when targeting
+real-world (often-out-of-spec) sources.
+
+The trade-off it surfaces: at non-textbook line periods, the
+sample-count delay no longer hits the fSC × delay = integer + 0.5
+cycles condition that gives clean chroma cancellation in Y. We
+print the residual percent in the diagnostic. The Y LPF at 3 MHz
+sweeps the carrier residue out — at the cost of some Y bandwidth,
+which is the same compromise BPF mode makes. The C path still
+benefits because we extract chroma from the comb difference (no
+BPF impulse-response ringing on coloured edges).
+
+### What `--yc-mode comb` actually does, and why 2H not 1H
+
+`cvbs_decode.py` implements both: `--yc-mode bpf` is the BPF/LPF
+frequency split described above. `--yc-mode comb` (default) is a
+**2-line delay comb**:
+
+```
+x_delayed[t] = x[t - 2 × line_samples]
+Y_full = (x + x_delayed) / 2
+C_full = (x - x_delayed) / 2
+```
+
+**Why 2H and not 1H** — a common pitfall, easy to get wrong. The
+subcarrier-cycles-per-line `fSC × T_H = 4.43361875e6 × 64e-6 ≈
+283.7516`, i.e. the chroma phase advances by `0.7516 × 360° ≈ 270.6°`
+per line. Over 1 line that's nowhere near 180°, so 1H neither cancels
+nor reinforces chroma cleanly. Over 2 lines it's `~541° ≡ ~181°` —
+close enough to 180° that subtracting cancels chroma to within a few
+percent, and adding reinforces luma.
+
+(Note: the chroma cancellation here depends on the **sample-count
+delay** giving an integer + 0.5 of fSC cycles. The textbook
+3072 samples at 24 MSps = exactly 567.5 cycles. If you use a
+**different sample count** — e.g. the 3086 samples we end up using
+for the SMS to align luma — you DON'T get a clean half-cycle, and
+chroma rides through into Y. That's why the implementation always
+also runs Y through a 3 MHz LPF after the comb: it makes the comb
+robust to source clock drift, at the cost of Y bandwidth that, in
+this codebase, was capped at 3 MHz anyway.)
+
+(NTSC's `fSC × T_H = 227.5` exactly, so its chroma alternates 180°
+every single line — *that's* why NTSC uses a 1H comb. PAL needs 2H
+because of the 1/4-cycle-per-line offset; even then PAL also has the
+±V switch per line, which gets handled separately by the per-line
+V-flip step in the demod after rotation.)
+
+**What happens on the SMS Wonder Boy III capture:**
+
+- **BPF mode** (`--yc-mode bpf`): correct primaries, but visible
+  trailing afterimage after every sharp coloured edge — most obvious
+  on the heart sprite at top-left and the gold/potion icons. Matches
+  the (1) prediction above: ~7–8 pixels of trailing colour-tinted
+  ringing.
+
+- **Comb mode, first try (textbook 3072-sample delay)**: horrible
+  horizontal blur of the entire picture. Cause: SMS modulator clock
+  drift (64.28 µs lines vs 64.00 µs spec) meant 3072 samples wasn't
+  actually 2H — the sample at `t - 3072` landed 14 samples into the
+  previous-but-one line, so Y averaged each pixel with a
+  horizontally-shifted copy of the same content from 2 lines back.
+  See the "1980s TVs used a FIXED 2H delay" section above for why
+  this is the inevitable failure mode of a fixed-delay comb on a
+  cheap modulator.
+
+- **Comb mode, second try (auto-measured 2H = 3086 samples, plus
+  Y LPF)**: blur gone. Expected new artifact: vertical-detail leakage
+  into chroma (where the picture brightness changes line-to-line —
+  e.g. a sprite's top/bottom edge — the comb's luma-cancellation
+  breaks down and some luma leaks into C, showing as a coloured
+  fringe at horizontal edges). Real PAL TVs accepted this — the
+  canonical Y/C trade-off.
+
+**For the C++ port:** start with the 2H comb. If vertical-detail
+fringes are visible enough to bother you, the next step up is an
+*adaptive comb* (use 2H comb where vertical detail is low, switch
+to BPF where it's high), which is what late-1980s onward digital TVs
+implemented. The pure 2H comb is what mid-1980s sets did.
 
 ## What does and doesn't work
 
@@ -812,13 +1054,19 @@ trade-off, which real TVs accepted.
   Recommended over v5 for monochrome rendering of clean signals.
 - `tools/cvbs_to_image_v7.py` — first colour decoder attempt. Had six
   bugs (notably: auto-detecting fSC from spectrum peak, class-blind
-  per-line rotation). Kept for historical reference. **Use v8 for
-  colour.**
-- `tools/cvbs_to_image_v8.py` — current colour decoder. Fixed fSC at
-  textbook 4.43361875 MHz, class-aware per-line burst rotation, and
-  auto-resolves the 2-fold V-inversion ambiguity by picking the
-  self-consistent hypothesis. Tested against `hacktv -m pal --filter
-  test:colourbars` synthetic source (decoded primaries match).
+  per-line rotation). Kept for historical reference. **Use
+  `cvbs_decode.py` for colour going forward.**
+- `tools/cvbs_decode.py` — **current canonical decoder** (was "v8"
+  during the bug-hunt narrative above). Fixed fSC at textbook
+  4.43361875 MHz, class-aware per-line burst rotation, auto-resolves
+  the 2-fold V-inversion ambiguity by picking the self-consistent
+  hypothesis. `--yc-mode {bpf,comb}` selects Y/C separator: BPF is the
+  cheap frequency split and exhibits chroma "echoes" after sharp edges
+  (BPF impulse-response ringing); comb is a 2H delay-line comb that
+  avoids the ringing but loses chroma vertical resolution on stripes.
+  Default is `comb`. Tested against `hacktv -m pal --filter
+  test:colourbars` synthetic source and the SMS Wonder Boy III
+  capture; both decode with correct primaries.
 - `tools/demod_stream.py` — chunked streaming demod sketched out as
   the architecture an eventual C++ port would use. Reads raw int16
   from stdin, writes baseband CVBS at 8 MSps (decimated 3×) to

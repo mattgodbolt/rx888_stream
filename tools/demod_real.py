@@ -53,6 +53,16 @@ def main():
                     help="LPF FIR tap count. Default 257.")
     ap.add_argument("--skip-secs", type=float, default=0.05,
                     help="Skip this many seconds at the start (warm-up). Default 0.05.")
+    ap.add_argument("--demod", choices=("envelope", "sync", "bluestein"),
+                    default="envelope",
+                    help="'envelope' (default): |I+jQ|, the naïve AM detector. "
+                         "Known to produce chroma trails on VSB sources (PAL "
+                         "B/G is VSB). 'sync': estimate residual carrier "
+                         "frequency error from the analytic-signal spectrum, "
+                         "refine the LO, take Real(I+jQ) only — discards the "
+                         "Q² quadrature-distortion term entirely. 'bluestein': "
+                         "keep |I+jQ| but subtract the Q²/(2I) distortion term "
+                         "analytically.")
     args = ap.parse_args()
 
     fs = args.fs
@@ -110,16 +120,80 @@ def main():
     Q = oaconvolve(bb_i, lpf, mode='same').astype(np.float32)
     del bb_r, bb_i
 
-    env = np.sqrt(I*I + Q*Q).astype(np.float32)
-    print(f"envelope: mean={env.mean():.0f} std={env.std():.0f} "
-          f"range={env.min():.0f}..{env.max():.0f}", file=sys.stderr)
+    if args.demod == "envelope":
+        # Naïve AM envelope detection. For VSB sources (PAL B/G), this
+        # introduces quadrature distortion: the Q² self-product creates a
+        # chroma-band ripple that decays slowly past sharp coloured edges
+        # — the "chroma trail" / "UV pre-echo on blue" artifact (Bluestein
+        # 1979; windytan 2019).
+        demoded = np.sqrt(I*I + Q*Q).astype(np.float32)
+        print(f"envelope: mean={demoded.mean():.0f} std={demoded.std():.0f} "
+              f"range={demoded.min():.0f}..{demoded.max():.0f}", file=sys.stderr)
 
-    # PAL B/G/I uses NEGATIVE modulation: sync tip = max carrier amplitude.
-    # cvbs_to_image_v5.py expects sync at the low end, so invert.
-    peak = float(np.percentile(env, 99.9))
-    floor = float(np.percentile(env, 0.1))
+    elif args.demod == "sync":
+        # Synchronous (coherent) demodulation. After the initial mix the
+        # signal is at baseband but the LO frequency may be off by a few
+        # tens of Hz (FFT carrier-detect resolution + R828D drift). We
+        # measure the residual offset from the centroid of |I+jQ|'s
+        # spectrum near 0 Hz, refine the LO, then take Real(I+jQ) only.
+        # Real(I+jQ) IS the wanted modulating signal m(t) when phase is
+        # locked; Q is the unwanted VSB quadrature residue, discarded.
+        from scipy.signal import hilbert
+        print("estimating residual carrier offset...", file=sys.stderr)
+        # complex baseband, downsampled for speed
+        cplx = (I + 1j * Q).astype(np.complex64)
+        # Residual carrier line is the DC component of |cplx|² should be
+        # at exactly 0 Hz if LO is right. Estimate offset from spectrum
+        # peak in a narrow window around 0.
+        N = min(len(cplx), 1 << 22)
+        spec = np.fft.fftshift(np.fft.fft(cplx[:N] * np.hanning(N).astype(np.float32)))
+        freqs = np.fft.fftshift(np.fft.fftfreq(N, 1.0 / fs))
+        # Search for residual peak within ±20 kHz of DC
+        mask = (freqs > -2e4) & (freqs < 2e4)
+        idx = np.argmax(np.abs(spec[mask]))
+        df_residual = float(freqs[mask][idx])
+        print(f"  residual carrier offset: {df_residual:+.2f} Hz "
+              f"(refining LO to {(fc+df_residual)/1e6:.6f} MHz)", file=sys.stderr)
+        # Derotate
+        phase_corr = (-2 * np.pi * df_residual / fs) * np.arange(len(cplx), dtype=np.float64)
+        cplx *= np.exp(1j * phase_corr).astype(np.complex64)
+        # Now estimate residual STATIC phase from sync-tip samples (where
+        # the signal has the largest amplitude, so the modulating signal
+        # is most determinate). Sync tip carries no chroma; phase here
+        # should be 0 if LO is locked.
+        mag = np.abs(cplx)
+        sync_thr = np.percentile(mag, 99.5)
+        sync_mask = mag > sync_thr
+        static_phase = float(np.angle(cplx[sync_mask].sum()))
+        print(f"  static residual phase: {np.degrees(static_phase):+.2f}°",
+              file=sys.stderr)
+        cplx *= np.exp(-1j * static_phase)
+        # Real part only
+        demoded = cplx.real.astype(np.float32)
+        del cplx
+        print(f"sync-demod (Re): mean={demoded.mean():.0f} std={demoded.std():.0f} "
+              f"range={demoded.min():.0f}..{demoded.max():.0f}", file=sys.stderr)
+
+    elif args.demod == "bluestein":
+        # Bluestein's compensation: keep |I+jQ| but subtract Q²/(2I) which
+        # is the analytical quadrature-distortion term for a VSB-modulated
+        # signal. Cheaper than synchronous demod (no carrier refinement)
+        # but only an approximation.
+        env = np.sqrt(I*I + Q*Q).astype(np.float32)
+        # Floor I to avoid division blowup on near-zero crossings
+        I_floor = np.maximum(np.abs(I), 0.05 * np.percentile(np.abs(I), 95))
+        correction = (Q * Q) / (2.0 * I_floor)
+        demoded = (env - correction).astype(np.float32)
+        print(f"bluestein-corrected: env range={env.min():.0f}..{env.max():.0f}, "
+              f"correction range={correction.min():.0f}..{correction.max():.0f}",
+              file=sys.stderr)
+
+    # PAL B/G/I uses NEGATIVE modulation: sync tip = max signal amplitude.
+    # cvbs_decode.py expects sync at the low end, so invert.
+    peak = float(np.percentile(demoded, 99.9))
+    floor = float(np.percentile(demoded, 0.1))
     span = max(peak - floor, 1.0)
-    out = np.clip((peak - env) / span * 48000.0 - 24000.0,
+    out = np.clip((peak - demoded) / span * 48000.0 - 24000.0,
                   -32760, 32760).astype(np.int16)
     out.tofile(args.output)
     print(f"wrote {args.output} ({len(out)} int16 samples = {len(out)/fs:.2f} s)",
