@@ -14,7 +14,7 @@ use std::{
 
 use bytemuck::cast_slice_mut;
 use clap::{value_parser, Parser, Subcommand, ValueEnum};
-use rusb::{Context, UsbContext};
+use rusb::{Context, DeviceHandle, UsbContext};
 use rusb_async::TransferPool;
 use rx888::{
     rx888_send_argument, rx888_send_command, rx888_send_command_u64, ArgumentList, FX3Command,
@@ -214,6 +214,30 @@ fn open_device_with_vid_pid_timeout(
     None
 }
 
+/// Stops the FX3's GPIF streaming engine when dropped.
+///
+/// The capture loop's normal exit sends STOPFX3 explicitly, but a signal
+/// (SIGINT/SIGTERM) interrupts the blocking libusb event wait and makes
+/// `rusb-async`'s `poll()` panic *from inside the crate* (it `panic!`s on any
+/// `libusb_handle_events` error, including EINTR / error -10). A panic skips
+/// the explicit shutdown, so without this guard an interrupted capture leaves
+/// the FX3 streaming into a dead endpoint — the next run then wedges
+/// (STARTFX3 timeout / RESETFX3 Io) and needs a physical replug.
+///
+/// As a Drop guard it runs during the panic unwind too (the build uses the
+/// default `panic = "unwind"`), guaranteeing STOPFX3 is sent on every exit
+/// path. Errors are ignored: we're tearing down regardless.
+struct Fx3StopGuard {
+    handle: Arc<DeviceHandle<Context>>,
+}
+
+impl Drop for Fx3StopGuard {
+    fn drop(&mut self) {
+        let _ = rx888_send_command(self.handle.as_ref(), FX3Command::STARTADC, 10_000_000);
+        let _ = rx888_send_command(self.handle.as_ref(), FX3Command::STOPFX3, 0);
+    }
+}
+
 fn main() {
     let args = Cli::parse();
     let context = Context::new().expect("Could not create USB context");
@@ -318,9 +342,9 @@ fn main() {
     let num_transfers = args.num_transfers;
     let gain = match args.gain_mode {
         GainMode::High => args.gain | 0x80,
-        GainMode::Low => args.gain
+        GainMode::Low => args.gain,
     };
-    
+
     let terminate = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let terminate = terminate.clone();
@@ -371,14 +395,21 @@ fn main() {
             if let Some(spec) = r82xx_write {
                 for entry in spec.split(',') {
                     let entry = entry.trim();
-                    if entry.is_empty() { continue; }
-                    let (reg_s, val_s) = entry.split_once('=')
-                        .unwrap_or_else(|| panic!("--r82xx-write entry must be REG=VAL, got {:?}", entry));
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    let (reg_s, val_s) = entry.split_once('=').unwrap_or_else(|| {
+                        panic!("--r82xx-write entry must be REG=VAL, got {:?}", entry)
+                    });
                     let parse_byte = |s: &str| {
                         let s = s.trim();
-                        let (radix, digits) = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                        let (radix, digits) = if let Some(rest) =
+                            s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
+                        {
                             (16, rest)
-                        } else { (10, s) };
+                        } else {
+                            (10, s)
+                        };
                         u8::from_str_radix(digits, radix)
                             .unwrap_or_else(|_| panic!("bad byte in --r82xx-write: {:?}", s))
                     };
@@ -388,13 +419,18 @@ fn main() {
                     //   (reg<<8) | val  — high byte = register, low byte = value
                     //   (val<<8) | reg  — opposite (matches USB little-endian byte order)
                     // Switch via env var RX888_POKE_SWAP=1
-                    let swap = std::env::var("RX888_POKE_SWAP").map(|v| v == "1").unwrap_or(false);
+                    let swap = std::env::var("RX888_POKE_SWAP")
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
                     let packed = if swap {
                         ((val as u16) << 8) | (reg as u16)
                     } else {
                         ((reg as u16) << 8) | (val as u16)
                     };
-                    eprintln!("R82XX I2C write: reg 0x{:02x} = 0x{:02x} (packed wValue=0x{:04x})", reg, val, packed);
+                    eprintln!(
+                        "R82XX I2C write: reg 0x{:02x} = 0x{:02x} (packed wValue=0x{:04x})",
+                        reg, val, packed
+                    );
                     rx888_send_argument(&handle, ArgumentList::R82XX_I2C_WRITE, packed)
                         .expect("Could not send R82XX_I2C_WRITE");
                 }
@@ -429,6 +465,12 @@ fn main() {
     rx888_send_command(&handle, FX3Command::STARTFX3, 0).expect("Could not start FX3");
 
     let handle = Arc::new(handle);
+    // Guarantees STOPFX3 on every exit path, including a signal-induced panic
+    // inside rusb-async's poll(). See Fx3StopGuard. Declared before the
+    // transfer pool so it drops *after* the pool cancels its transfers.
+    let _stop_guard = Fx3StopGuard {
+        handle: handle.clone(),
+    };
     let mut transfer_pool =
         TransferPool::new(handle.clone()).expect("Could not create transfer pool");
 
@@ -442,16 +484,26 @@ fn main() {
     let mut measurement = Measurement::new();
 
     while !terminate.load(std::sync::atomic::Ordering::Relaxed) {
-        let mut data = transfer_pool.poll(timeout).expect("Transfer failed");
+        let mut data = match transfer_pool.poll(timeout) {
+            Ok(data) => data,
+            // A signal (SIGINT/SIGTERM) interrupting the blocking libusb event
+            // wait can surface here as an error. If the handler has already set
+            // `terminate`, this is an orderly shutdown: break to the graceful
+            // STOPFX3 below rather than treating it as a fatal transfer error.
+            // (The signal can alternatively make poll() panic from inside
+            // rusb-async on EINTR — that path is covered by Fx3StopGuard.)
+            Err(_) if terminate.load(std::sync::atomic::Ordering::Relaxed) => break,
+            Err(e) => panic!("Transfer failed: {e:?}"),
+        };
         if args.randomize {
             let data_u16: &mut [u16] = cast_slice_mut(&mut data);
             for i in 0..data_u16.len() {
                 data_u16[i] ^= 0xFFFE * (data_u16[i] & 0x1);
             }
         }
-        let _ = output_file.iter_mut().for_each(|file| {
-            file.write_all(&data).expect("Stream output error")
-        });
+        let _ = output_file
+            .iter_mut()
+            .for_each(|file| file.write_all(&data).expect("Stream output error"));
         if args.measure || output_file.is_none() {
             measurement.add_packet(data.len() / 2);
             measurement.maybe_display(Duration::from_secs(1));
@@ -462,8 +514,6 @@ fn main() {
     }
 
     transfer_pool.cancel_all();
-
-    rx888_send_command(handle.as_ref(), FX3Command::STARTADC, 10000000)
-        .expect("Could not downclock ADC");
-    rx888_send_command(handle.as_ref(), FX3Command::STOPFX3, 0).expect("Could not stop FX3");
+    // STARTADC-downclock + STOPFX3 are sent by Fx3StopGuard's Drop as the
+    // scope unwinds — on both the normal break above and a poll() panic.
 }

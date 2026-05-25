@@ -1246,12 +1246,37 @@ buffers.
   Earlier variants (`_v3.py`, `_v4.py`) tried full interlace but
   produced doubled-text artifacts from per-field horizontal jitter.
   Worth another go with the now-stable LO.
-- **Post-capture FX3 stuck state**: occasionally after a SIGTERM
-  exit, the next invocation hits `STARTFX3: Timeout` and
-  `RESETFX3: Io`. Recoverable via sysfs (`echo 0 | sudo tee
-  /sys/bus/usb/devices/2-1/authorized; sleep 1; echo 1 | sudo tee
-  /sys/bus/usb/devices/2-1/authorized`) or physical replug. Probably
-  a missing `STOPFX3` on signal-driven exit — worth tracking down.
+- **Post-capture FX3 stuck state — graceful-shutdown half FIXED.**
+  The capture loop only sent its `STOPFX3` (and ADC downclock) on a
+  *graceful* exit, and the graceful exit only happened on a signal the
+  handler actually caught. Two holes, now plugged:
+    1. `ctrlc` was pulled in without the `termination` feature, so the
+       handler caught **SIGINT only**. Wrapping captures in `timeout N`
+       (which sends **SIGTERM**) bypassed it entirely — the process was
+       killed dead mid-stream, GPIF engine still running, no `STOPFX3`.
+       That's why "it didn't used to happen": interactive Ctrl-C
+       (SIGINT) was handled and shut down cleanly; automated `timeout`
+       (SIGTERM) was not. Fix: `ctrlc = { features = ["termination"] }`.
+    2. Even once the signal is caught, it interrupts the blocking
+       libusb event wait and makes `rusb-async`'s `poll()` **panic from
+       inside the crate** (it `panic!`s on any `libusb_handle_events`
+       error, incl. EINTR / error −10), skipping the explicit `STOPFX3`.
+       Fix: an `Fx3StopGuard` Drop guard that sends `STOPFX3` during the
+       panic unwind too (build is the default `panic = "unwind"`).
+       Verified: a `kill -TERM` to a streaming process now exits 0 with
+       `stopfx3=Ok`; before, it was killed with no `STOPFX3`.
+  Immediate workaround if running an old binary: `timeout -s INT N …`
+  (SIGINT *is* caught).
+  **Still open — a SEPARATE flakiness:** `-f` firmware reload
+  intermittently times out at `STARTFX3` regardless of how the previous
+  run ended (and the device sometimes re-enumerates 00f1→00f3 on its
+  own between runs). Prime suspect is the fixed `thread::sleep(1000ms)`
+  after `fx3_load_ram` (`main.rs`) racing the FX3's re-enumeration —
+  should be a poll-until-ready instead. Recover meanwhile via sysfs
+  (`SYS=$(for d in /sys/bus/usb/devices/*/; do [ "$(cat $d/idVendor
+  2>/dev/null)" = 04b4 ] && echo $d; done); echo 0 | sudo tee
+  ${SYS}authorized; sleep 1; echo 1 | sudo tee ${SYS}authorized`) or a
+  physical replug.
 - **Colour decoder** — v8 supersedes v7 and produces correct
   primaries on the `hacktv` synthetic test source. Per-line hue
   drift seen in v7 is resolved (root cause was an off-by-23-kHz
