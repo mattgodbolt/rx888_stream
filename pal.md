@@ -983,6 +983,48 @@ back-off gain → grain) is therefore not register-fixable; the only untested
 lever for the grain is front-end vs IF **gain redistribution** at the low-IF
 position (more LNA/RF, less IF/VGA, for a better noise figure).
 
+### Gain redistribution at the low-trail IF — cracks the trade-off
+
+Tested that lever and it works. At vision IF ≈ 3.6 MHz (`--frequency
+590200000`), pushing the **front-end LNA high and the IF VGA low**
+(`--vhf-lna 28 --vhf-vga 4`) gave grain **1.37** (border-patch std), vs
+**2.71** for a balanced/low-LNA split at the *same* IF, and below even the
+IF-4.1 capture's **1.51** — and it did so at a *lower* overall level
+(raw std 3254 vs ~7000), so it's the noise figure improving, not the
+level. So the long-standing "low IF kills the trail but adds grain"
+trade-off was really "low IF **plus a poor gain split**"; with the gain
+weighted to the front-end you get **low trail and low grain together**.
+
+**Emerging best recipe (SMS):** `--frequency 590200000`
+(vision IF ≈ 3.6, chroma centred in the IF passband → minimal trail)
+with `--vhf-lna 28 --vhf-vga 4` (front-end-heavy gain → low grain).
+
+**Caveat:** the matched *low*-LNA control at the same IF/stack couldn't
+be captured (FX3 wedged on the second capture — see below), so this isn't
+a perfectly controlled A/B; it rests on gA being the lowest grain of every
+capture in the session, at a lower level, plus the clean image (sharp
+yellow title text, no tails).
+
+**Residual artifacts noted on review (open):**
+- Mild grain in flat areas (blue gradients, grey HUD bars) — front-end
+  NF is good now but not zero; worth trying yet more LNA / a touch of
+  oversampling stacked on top.
+- **Raised black level** — black borders aren't jet-black. Points at the
+  black-level clamp / DC handling in `demod_real.py`'s percentile
+  normalisation or `cvbs_decode`'s black reference; a proper back-porch
+  clamp would fix it.
+- Slight softness on the SDDC colour decode — likely the demod LPF /
+  line-resample; revisit filter order and the resample kernel.
+
+**FX3 multi-capture reliability (still open):** the signal-exit/STOPFX3
+fix made *paced single* captures reliable, but the **second `-f` capture
+right after one** tends to fail, and rapid sequences wedge the chip
+(twice off the USB bus entirely in this session, needing a physical
+replug). No-`-f` runs can't self-heal a wedged-but-enumerated device.
+This made the gain experiment a slog. The vendor `nusb` driver was far
+more reliable for repeated captures — another reason it's the better base
+for capture-heavy work.
+
 ### R828D register-poke experiments — inconclusive (earlier session)
 
 Restored the `--r82xx-write REG=VAL` flag from stash (requires
