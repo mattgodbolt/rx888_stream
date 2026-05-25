@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capturing &amp; decoding PAL TV with the RX888 mk2</title>
+<style>
+  :root {
+    --fg: #1b1b1b;
+    --bg: #fbfbf9;
+    --muted: #666;
+    --accent: #8a3b1e;
+    --rule: #e2ddd4;
+    --code-bg: #f3efe7;
+    --ok: #2e7d32;
+    --warn: #b26a00;
+    --bad: #b3261e;
+    --card: #fff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+  }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 2.5rem 1.25rem 5rem; }
+  header.hero {
+    border-bottom: 3px solid var(--accent);
+    padding-bottom: 1.25rem;
+    margin-bottom: 2rem;
+  }
+  h1 { font-size: 2.1rem; line-height: 1.15; margin: 0 0 .4rem; }
+  .subtitle { color: var(--muted); font-size: 1.05rem; margin: 0; }
+  .meta { color: var(--muted); font-size: .85rem; margin-top: 1rem; }
+  h2 {
+    font-size: 1.45rem;
+    margin: 2.8rem 0 .8rem;
+    padding-bottom: .3rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  h3 { font-size: 1.15rem; margin: 1.8rem 0 .5rem; }
+  a { color: var(--accent); }
+  code, pre { font-family: "SF Mono", "Cascadia Code", ui-monospace, Menlo, Consolas, monospace; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; font-size: .88em; }
+  pre {
+    background: var(--code-bg);
+    padding: 1rem 1.1rem;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: .85rem;
+    line-height: 1.45;
+    border: 1px solid var(--rule);
+  }
+  pre code { background: none; padding: 0; }
+  figure { margin: 1.5rem 0; }
+  figure img {
+    width: 100%;
+    border-radius: 8px;
+    border: 1px solid var(--rule);
+    background: #000;
+    display: block;
+  }
+  figcaption { color: var(--muted); font-size: .85rem; margin-top: .5rem; text-align: center; }
+  table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: .9rem; }
+  th, td { text-align: left; padding: .5rem .65rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-weight: 600; background: var(--code-bg); }
+  .tag { display: inline-block; font-size: .78rem; font-weight: 600; padding: .1em .55em; border-radius: 999px; }
+  .tag.ok   { color: var(--ok);   background: #e7f3e7; }
+  .tag.warn { color: var(--warn); background: #fbf0dc; }
+  .tag.bad  { color: var(--bad);  background: #fbe4e2; }
+  .lead { font-size: 1.1rem; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--rule);
+    border-left: 4px solid var(--accent);
+    border-radius: 6px;
+    padding: 1rem 1.2rem;
+    margin: 1.4rem 0;
+  }
+  .card.note   { border-left-color: #2f6fb3; }
+  .card.note   strong:first-child { color: #2f6fb3; }
+  .toc { background: var(--code-bg); border-radius: 8px; padding: 1rem 1.4rem; }
+  .toc ol { margin: .3rem 0; padding-left: 1.3rem; }
+  .toc a { text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .chain { font-size: .88rem; color: var(--muted); margin: 1rem 0; }
+  .chain b { color: var(--fg); }
+  footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--rule); color: var(--muted); font-size: .85rem; }
+  .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 600px) { .twocol { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>Capturing &amp; decoding PAL TV with the RX888 mk2</h1>
+  <p class="subtitle">End-to-end recovery of a UK PAL signal from a Sega Master System II's
+  RF modulator &mdash; from raw SDR samples to a decoded colour frame &mdash; on Linux.</p>
+  <p class="meta">Investigation captured in commits dated 2026-05-24.
+  Full technical write-up lives in <code>pal.md</code> in this repo; this page is the illustrated summary.</p>
+</header>
+
+<p class="lead">An RX888 mk2 software-defined radio, a 1980s game console's
+TV modulator, and a stack of Python DSP. The goal: take the analog PAL
+broadcast a Master System emits on UHF, sample it wholesale through the
+SDR, and rebuild the picture in software the way a 1980s colour TV would
+have &mdash; sync separator, burst-locked subcarrier, the Phase Alternating
+Line trick, the lot.</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#result">The result</a></li>
+    <li><a href="#pipeline">The pipeline, stage by stage</a></li>
+    <li><a href="#bug">The bug that hid the signal for days</a></li>
+    <li><a href="#colour">Getting colour right</a></li>
+    <li><a href="#artifacts">The two artifacts: ripples and trails</a></li>
+    <li><a href="#status">What works, what doesn't</a></li>
+    <li><a href="#next">Where this goes next</a></li>
+  </ol>
+</div>
+
+<h2 id="result">1. The result</h2>
+
+<p>The headline: a recognisable, full-colour picture pulled entirely from
+raw SDR samples. Below is a decode of <em>Wonder Boy III: The Dragon's
+Trap</em> gameplay &mdash; envelope-demodulated, sync-separated,
+burst-locked and colour-decoded by <code>cvbs_decode.py</code>, captured at the
+590.7&nbsp;MHz workaround tune.</p>
+
+<figure>
+  <img src="decoded_wb3_colour_jump.png" alt="Decoded Wonder Boy III gameplay, colour, character mid-jump">
+  <figcaption>Decoded from raw RX888 samples: the hero mid-jump over the sea.
+  Red heart and "GET 5 GOLD" HUD up top, blue potion icon, green platforms,
+  blue water, red coral. All primaries correct.</figcaption>
+</figure>
+
+<figure>
+  <img src="decoded_wb3_colour_palm.png" alt="Decoded Wonder Boy III gameplay, colour, palm tree visible">
+  <figcaption>A second field from the same capture &mdash; the palm tree on the
+  right and the coral blocks resolve cleanly.</figcaption>
+</figure>
+
+<p>It started in monochrome. Here is the <em>Alex Kidd in Miracle World</em>
+title screen, sync-separated and rendered full-width by
+<code>cvbs_to_image_v6.py</code> &mdash; the mono path that came first:</p>
+
+<figure>
+  <img src="decoded_alex_kidd_title.png" alt="Decoded Alex Kidd in Miracle World title screen">
+  <figcaption>The <code>PUSH START BUTTON</code> / &copy; SEGA 1990 title screen.
+  The grey band is the field-blanking interval where the single-field renderer wraps.</figcaption>
+</figure>
+
+<p>That clean picture took some doing. The signal was, at first, completely
+invisible.</p>
+
+<h2 id="pipeline">2. The pipeline, stage by stage</h2>
+
+<p>Five stages turn a wall of complex samples into a picture. Here's each
+one in plain terms.</p>
+
+<div class="chain">
+  <b>raw IQ</b> &rarr; <b>demodulate</b> &rarr; <b>find the frame (V&nbsp;sync)</b>
+  &rarr; <b>find each line (H&nbsp;sync)</b> &rarr; <b>recover colour</b> &rarr; <b>pixels</b>
+</div>
+
+<h3>Capture</h3>
+<p>The RX888 tunes its R828D silicon tuner near 591&nbsp;MHz (UK UHF
+channel&nbsp;36) and hands its analog signal down to an intermediate
+frequency around 4.5&nbsp;MHz, then samples it at 24&nbsp;million samples a
+second. The output is a firehose of raw 16-bit numbers &mdash; roughly
+48&nbsp;MB every second &mdash; describing the radio wave's wiggle. No
+picture yet; just the carrier and everything riding on it.</p>
+
+<h3>Demodulation</h3>
+<p>PAL vision is amplitude-modulated with <em>negative</em> polarity:
+loud&nbsp;=&nbsp;dark, quiet&nbsp;=&nbsp;bright, and the sync pulses are the
+loudest thing of all. We shift the carrier down to zero, low-pass it, take
+the envelope (how big the wiggle is, moment to moment), and flip it. Out
+comes the classic composite-video (CVBS) waveform: a voltage that rises and
+falls with brightness, with sync pulses punched below black.</p>
+
+<h3>V-sync detection &mdash; finding the frame</h3>
+<p>The TV needs to know where each <em>field</em> starts. PAL marks it with
+a run of unusually long "broad" pulses in the signal. We low-pass the CVBS,
+slice it into pulses, classify them by duration, and look for a run of broad
+pulses &mdash; that's the top of the picture. Get this wrong and the image
+wraps vertically, status bar stranded in the middle.</p>
+
+<h3>H-sync &mdash; finding each line</h3>
+<p>Within a field, every scanline begins with a short ~4.7&nbsp;&micro;s sync
+pulse. Lock onto those and you know exactly where each of the ~300 lines
+starts, so they stack vertically instead of shearing. The Master System's
+modulator runs ~0.4% slow (64.28&nbsp;&micro;s lines, not 64.00), so we
+<em>measure</em> the real line period from the sync gaps rather than trusting
+the textbook value.</p>
+
+<h3>Colour</h3>
+<p>Colour rides on a 4.43361875&nbsp;MHz subcarrier. Each line carries a short
+"burst" of this subcarrier in its back porch as a phase reference. We build a
+continuous local oscillator at exactly that textbook frequency, measure the
+burst phase line by line, rotate the chroma to line up, undo PAL's
+alternating-line V-sign trick, and matrix the resulting U/V plus brightness
+into RGB. The detail that makes or breaks it is below.</p>
+
+<h2 id="bug">3. The bug that hid the signal</h2>
+
+<p>For a long stretch across earlier sessions, the conclusion was "the RX888's
+analog noise floor is too high to recover the picture." Wrong. There were
+three red herrings before the real cause:</p>
+
+<ul>
+  <li><strong>"The firmware doesn't pass RF to the mixer."</strong> The flat
+  noise pedestal we saw <em>was</em> the IF chain &mdash; just running on its own
+  internal noise, because nothing real was reaching it.</li>
+  <li><strong>"It's USB&nbsp;1.1 stale buffers."</strong> True on the old laptop
+  (12&nbsp;Mbps couldn't keep up), but the signal stayed invisible on a healthy
+  USB&nbsp;3 desktop too.</li>
+  <li><strong>"The firmware version matters."</strong> Four different working
+  firmwares produced byte-for-byte similar spectra. Not the variable.</li>
+</ul>
+
+<p>The actual fault was one line. <code>rx888_stream</code> initialised the
+R828D tuner with a reference clock of <code>0</code>:</p>
+
+<pre><code>// before
+rx888_send_command(&amp;handle, FX3Command::TUNERINIT, 0)
+
+// after &mdash; pass the 16 MHz reference the tuner's PLL needs
+rx888_send_command(&amp;handle, FX3Command::TUNERINIT, 16_000_000)</code></pre>
+
+<p>With a zero reference, the tuner's PLL free-ran: the vision carrier landed
+at 2.07, 2.82, 3.00, 3.64, 6.25&nbsp;MHz &mdash; a different place every single
+capture. With the correct 16&nbsp;MHz reference it locks to the designed
+4.57&nbsp;MHz IF, reproducibly, forever. Filed upstream as
+<a href="https://github.com/rhgndf/rx888_stream/issues/15">issue&nbsp;#15</a> /
+<a href="https://github.com/rhgndf/rx888_stream/pull/16">PR&nbsp;#16</a>.</p>
+
+<div class="card">
+  <strong>Discipline note.</strong> "We have signal!" was declared at least
+  three times during debugging, each time on a spectral feature that turned out
+  to be receiver-internal structure or RFI. The rule that came out of it: never
+  trust one spectrum. Three controls every time &mdash; <em>source-off</em> (peak
+  vanishes?), <em>tune-off</em> (peak moves with the tune?), <em>reproduction</em>
+  (same peak next capture?). The final result passes all three with a 221&times;
+  std ratio when the SMS is switched off.
+</div>
+
+<h2 id="colour">4. Getting colour right</h2>
+
+<p>The first colour decoder (v7) produced garbage even on a <em>clean
+synthetic</em> test signal &mdash; a sea of green where there should have been
+colour bars. That was the tell: the bug was in the decoder, not the capture.
+We switched to <code>hacktv</code>-generated PAL colour bars as a known-good
+input and found six bugs against the canonical reference implementation. The
+two that mattered most:</p>
+
+<ol>
+  <li><strong>The subcarrier frequency was being auto-detected from the
+  spectrum</strong>, and it picked a chroma sideband 23&nbsp;kHz off. A
+  23&nbsp;kHz error winds the local oscillator more than a full turn across each
+  scanline &mdash; colours smear from one hue to another left-to-right. The fix:
+  use the textbook 4.43361875&nbsp;MHz as a fixed constant, exactly like a real
+  TV's crystal.</li>
+  <li><strong>The per-line phase rotation ignored which class of line it was
+  on.</strong> PAL alternates its burst &plusmn;135&deg; line to line; correcting
+  every line the same way scrambled the colour on half of them. The fix is
+  class-aware rotation, plus auto-detecting which line parity is V-inverted by
+  picking the self-consistent hypothesis.</li>
+</ol>
+
+<p>With those fixed, the decoder produces correct primaries on both the
+synthetic colour bars and the real Master System capture: red heart, blue
+potion, yellow tiles, light-blue underwater background.</p>
+
+<h2 id="artifacts">5. The two artifacts: ripples and trails</h2>
+
+<p>Two distinct defects remained, and a lot of the investigation's rigour went
+into <em>not</em> conflating them.</p>
+
+<h3>Type A &mdash; ripples in solid colour <span class="tag ok">fixed</span></h3>
+<p>A solid red bar came out with a faint periodic ripple every ~13 columns.
+Cause: the PAL-B/G FM <strong>sound subcarrier</strong> at vision+5.5&nbsp;MHz
+was leaking through the chroma band-pass filter's upper edge, beating down to
+1.07&nbsp;MHz and landing inside the colour-difference passband. Proven by
+toggling <code>hacktv --noaudio</code>: the ripple vanished completely
+(red-bar variation 29.57&nbsp;&rarr;&nbsp;0.00). Fix: pull the chroma BPF upper
+cutoff from 5.5&nbsp;MHz down to 5.0&nbsp;MHz. Just like the sound trap a real
+PAL receiver puts before its video detector.</p>
+
+<h3>Type B &mdash; colour trail past sharp edges <span class="tag warn">isolated, not software-fixable</span></h3>
+<p>The red heart sprite drags a ~20-column blue tail off its right edge. This
+one resisted four separate "it must be X" theories &mdash; BPF ringing,
+comb-filter error, envelope-detector quadrature distortion, sound leakage
+&mdash; each confidently asserted and then disproved. So instead of guessing
+again, we ran an isolating experiment: feed <code>hacktv</code>'s known-clean
+signal through the <em>exact same</em> DSP. Zero trail. The pipeline is
+faithful; the trail enters upstream, in the capture chain.</p>
+
+<p>The clincher was sweeping the tuner's IF position while the same SMS stayed
+plugged in &mdash; identical DSP, only the R828D's internal frequency changing:</p>
+
+<table>
+  <thead><tr><th><code>--frequency</code></th><th>Vision IF</th><th>Trail energy past sprite</th></tr></thead>
+  <tbody>
+    <tr><td>591.2 MHz (default)</td><td>4.59 MHz</td><td>4975 (moderate)</td></tr>
+    <tr><td>590.7 MHz</td><td>4.10 MHz</td><td><strong>364</strong> (5&times; cleaner)</td></tr>
+    <tr><td>590.2 MHz</td><td>3.60 MHz</td><td>0 (cleanest in sweep)</td></tr>
+    <tr><td>589.2 MHz</td><td>2.60 MHz</td><td>15228 (3&times; worse)</td></tr>
+    <tr><td>591.7 MHz</td><td>5.10 MHz</td><td>1560</td></tr>
+  </tbody>
+</table>
+
+<p>The trail varies &gt;3&times; with IF position, non-monotonically. That's
+the fingerprint of <strong>SAW-filter group-delay distortion</strong> in the
+R828D &mdash; a silicon DVB-T/C tuner whose acoustic filter was designed for
+digital reception, where group-delay flatness across the chroma band simply
+isn't a design goal. Plug the same SMS into a real PAL TV and the trail is
+gone, which corroborates: it's the tuner, not the console and not our code.</p>
+
+<div class="card">
+  <strong>Workaround.</strong> Tune one MHz low &mdash;
+  <code>--frequency 590700000</code> &mdash; to land the chroma sideband in a
+  flatter "valley" of the SAW's group-delay curve. ~5&times; less trail, no DSP
+  changes, signal still strong. Register pokes into the R828D were tried and
+  came up inconclusive (and register 0x0A is genuinely dangerous &mdash; a
+  bad write needs a physical replug to recover).
+</div>
+
+<h2 id="status">6. What works, what doesn't</h2>
+
+<table>
+  <thead><tr><th>Path</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>Linux + <code>rx888_stream</code> (with PR&nbsp;#16) + SMS &mdash; <strong>mono</strong></td><td><span class="tag ok">works</span> ~80 dB SNR, clean frame</td></tr>
+    <tr><td>Same + SMS &mdash; <strong>colour</strong></td><td><span class="tag ok">works</span> correct primaries, verified vs colour bars</td></tr>
+    <tr><td>BBC Micro (~588 MHz) &mdash; mono</td><td><span class="tag warn">partial</span> picture visible, sync fragile</td></tr>
+    <tr><td>BBC Micro &mdash; colour</td><td><span class="tag bad">no</span> weak-signal sync defeats it</td></tr>
+    <tr><td><code>rx888_stream</code> <em>without</em> PR&nbsp;#16</td><td><span class="tag bad">no</span> wandering carrier, no picture</td></tr>
+    <tr><td>HF + AM broadcast (wire antenna)</td><td><span class="tag ok">works</span></td></tr>
+    <tr><td>Heart-trail past coloured sprites</td><td><span class="tag warn">mitigated</span> ~5&times; reduced by IF-tune workaround</td></tr>
+  </tbody>
+</table>
+
+<h3>The recipe, in one block</h3>
+<pre><code># capture (5 s is plenty for several frames)
+rx888_stream vhf -f SDDC_FX3_v22.img -s 24000000 \
+    --frequency 590700000 --vhf-lna 14 --vhf-vga 8 --gain 1 \
+    -o cap.bin
+
+# demod to baseband CVBS (keep chroma for colour)
+python3 tools/demod_real.py cap.bin cvbs.s16 --fs 24e6 --lpf 5.5e6
+
+# decode to a colour frame
+python3 tools/cvbs_decode.py cvbs.s16 frame.png \
+    --yc-mode bpf --chroma-phase minimum</code></pre>
+
+<h2 id="next">7. Where this goes next</h2>
+<ul>
+  <li><strong>A different tuner.</strong> Non-RX888 hardware was on its way at
+  the close of the investigation &mdash; the cleanest test of the SAW-trail
+  theory is to swap the tuner and watch the trail go.</li>
+  <li><strong>Three-way comparison:</strong> RX888 decode vs a real PAL TV vs
+  the SMS-on-the-tuner, side by side off the same RF feed.</li>
+  <li><strong>Characterise the R828D SAW</strong> directly with a wideband
+  chirp, then design an inverse group-delay filter to flatten it in software.</li>
+  <li><strong>A C++ real-time port</strong> &mdash; the Python streaming demod
+  (<code>demod_stream.py</code>) runs at 0.42&times; realtime and is structured
+  as the architecture sketch for it.</li>
+  <li><strong>Sync separator hardening</strong> (Schmitt trigger + H-sync PLL)
+  to make the weak BBC Micro signal decodable.</li>
+  <li><strong>Full interlace</strong> instead of the current single-field
+  vertical doubling.</li>
+</ul>
+
+<footer>
+  <p>Generated from <code>pal.md</code> and the committed decode references in
+  this repo. Decoded frames: <code>cvbs_to_image_v6.py</code> (mono),
+  <code>cvbs_decode.py</code> (colour). Tooling and full technical notes are in
+  the repository &mdash; <code>pal.md</code> is the authoritative source.</p>
+</footer>
+
+</div>
+</body>
+</html>
