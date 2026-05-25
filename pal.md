@@ -276,7 +276,7 @@ above.
 
 A precis of the dead ends, so future-us doesn't re-walk them.
 
-### Day 1 (laptop): "the firmware doesn't pass RF to the mixer"
+### Mistake 1: "the firmware doesn't pass RF to the mixer" (on the laptop)
 
 Earlier sessions concluded — based on captures showing a flat ~+3.5 dB
 "noise pedestal" across the IF passband and no detectable line-rate
@@ -293,7 +293,7 @@ wasn't the noise floor — it was that the R828D's LO was free-running
 because `rx888_stream` was initialising the tuner without a
 reference-clock parameter.
 
-### Day 2 morning: "it was USB 1.1 stale buffers"
+### Mistake 2: "it was USB 1.1 stale buffers"
 
 On the previous Linux laptop the RX888 had enumerated at USB 1.1
 (12 Mbps) due to a flaky USB port. The streamer sent commands fine,
@@ -307,7 +307,7 @@ Also wrong. On the new desktop the device enumerated at USB 2.0
 high-speed (later 3.0 SuperSpeed), bulk transfers were healthy, and
 we *still* couldn't see the signal.
 
-### Day 2 afternoon: "the firmware version must matter"
+### Mistake 3: "the firmware version must matter"
 
 Spent considerable time trying four firmware variants — the existing
 `SDDC_FX3.img` in this tree (sha256 `824c575f…`), a fresh build from
@@ -323,7 +323,7 @@ A consulting LLM (asked in parallel by Matt) suggested the difference
 might be AGC handling, IF filter shape, or an off-by-one LNA index.
 None of those held up either.
 
-### Day 2 evening: the actual bug
+### The actual bug
 
 Reading the Windows host-side C++ in `ik1xpv/ExtIO_sddc`,
 `ExtIO_sddc/Core/radio/RX888R2Radio.cpp`, the VHF init sequence is:
@@ -380,7 +380,7 @@ The final PAL result passes all three with margin: 221× std ratio on
 SMS-off, line-rate comb that disappears entirely without the source,
 identical carrier position across reproductions.
 
-## Day 3: colour decoding
+## Colour decoding
 
 Goal: decode PAL chroma using only operations a 1980s analog colour TV
 would do — sync separator, burst-locked subcarrier oscillator, Y/C
@@ -429,7 +429,7 @@ drift's root cause isn't yet identified.
   Saved as a memory: present candidates with neutral labels and ask
   rather than declaring.
 
-### BBC Micro test source (Day 3 afternoon)
+### BBC Micro test source
 
 To get a controlled test signal, we connected a BBC Micro's RF output
 and typed `MODE 2` + a VDU sequence to set the background to a single
@@ -481,7 +481,7 @@ field that's trivially decodable. Several discoveries:
    and u8 versions of our CVBS, exactly matching what a previous
    session hit. Not pursued further.
 
-### Day 3 evening: v8 — `hacktv` test source, what was wrong with v7
+### v8 — `hacktv` test source, what was wrong with v7
 
 After hitting a wall trying to diagnose colour against unknown-state
 captures (SMS, BBC), we switched to a known-good synthetic source:
@@ -880,7 +880,7 @@ into a tuner designed for analog video (a 1980s/90s PAL TV) and the
 trail vanishes (confirmed by Matt — modern LCD TV via same RF feed
 gives a clean picture).
 
-**IF-position experiment (Day 5).** Captured the same SMS at three
+**IF-position experiment.** Captured the same SMS at three
 different R828D IF positions by varying `--frequency` while the SMS
 stayed plugged in:
 
@@ -905,7 +905,7 @@ chroma sideband, NOT amplitude rolloff — chroma amplitude was
 similar across positions; only the trail behaviour after sharp
 edges varied).
 
-**Practical workaround (Day 5): re-tune to land chroma on a flatter
+**Practical workaround: re-tune to land chroma on a flatter
 section of the SAW response.** A 5-point IF sweep was run by varying
 `--frequency` while the SMS stayed plugged in:
 
@@ -937,7 +937,7 @@ coloured sprites is ~5× weaker.
   per-line ψ would correct the average misregistration but not the
   trail itself.
 
-### R828D register-poke experiments (Day 5 evening) — inconclusive
+### R828D register-poke experiments — inconclusive
 
 Restored the `--r82xx-write REG=VAL` flag from stash (requires
 `SDDC_FX3_rebuild.img` firmware which exposes the
