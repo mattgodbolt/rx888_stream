@@ -290,43 +290,58 @@ toggling <code>hacktv --noaudio</code>: the ripple vanished completely
 cutoff from 5.5&nbsp;MHz down to 5.0&nbsp;MHz. Just like the sound trap a real
 PAL receiver puts before its video detector.</p>
 
-<h3>Type B &mdash; colour trail past sharp edges <span class="tag warn">isolated, not software-fixable</span></h3>
+<h3>Type B &mdash; colour trail past sharp edges <span class="tag ok">cracked</span></h3>
 <p>The red heart sprite drags a ~20-column blue tail off its right edge. This
-one resisted four separate "it must be X" theories &mdash; BPF ringing,
-comb-filter error, envelope-detector quadrature distortion, sound leakage
-&mdash; each confidently asserted and then disproved. So instead of guessing
-again, we ran an isolating experiment: feed <code>hacktv</code>'s known-clean
-signal through the <em>exact same</em> DSP. Zero trail. The pipeline is
-faithful; the trail enters upstream, in the capture chain.</p>
+one resisted four "it must be X" theories &mdash; BPF ringing, comb-filter
+error, envelope-detector quadrature distortion, sound leakage &mdash; each
+asserted and then disproved. So instead of guessing again, we ran an isolating
+experiment: feed <code>hacktv</code>'s known-clean signal through the
+<em>exact same</em> DSP. Zero trail. The pipeline is faithful; the trail
+enters upstream, in the capture chain.</p>
 
 <p>The clincher was sweeping the tuner's IF position while the same SMS stayed
-plugged in &mdash; identical DSP, only the R828D's internal frequency changing:</p>
+plugged in &mdash; identical DSP, only the R828D's internal IF frequency
+changing:</p>
 
 <table>
   <thead><tr><th><code>--frequency</code></th><th>Vision IF</th><th>Trail energy past sprite</th></tr></thead>
   <tbody>
     <tr><td>591.2 MHz (default)</td><td>4.59 MHz</td><td>4975 (moderate)</td></tr>
     <tr><td>590.7 MHz</td><td>4.10 MHz</td><td><strong>364</strong> (5&times; cleaner)</td></tr>
-    <tr><td>590.2 MHz</td><td>3.60 MHz</td><td>0 (cleanest in sweep)</td></tr>
+    <tr><td>590.2 MHz</td><td>3.60 MHz</td><td>~0 (cleanest in sweep)</td></tr>
     <tr><td>589.2 MHz</td><td>2.60 MHz</td><td>15228 (3&times; worse)</td></tr>
     <tr><td>591.7 MHz</td><td>5.10 MHz</td><td>1560</td></tr>
   </tbody>
 </table>
 
-<p>The trail varies &gt;3&times; with IF position, non-monotonically. That's
-the fingerprint of <strong>SAW-filter group-delay distortion</strong> in the
-R828D &mdash; a silicon DVB-T/C tuner whose acoustic filter was designed for
-digital reception, where group-delay flatness across the chroma band simply
-isn't a design goal. Plug the same SMS into a real PAL TV and the trail is
-gone, which corroborates: it's the tuner, not the console and not our code.</p>
+<div class="card note">
+  <strong>It's not a SAW.</strong> An earlier draft called this
+  "SAW-filter group-delay distortion." The RX888 mk2 VHF chain is
+  LPF&nbsp;&rarr;&nbsp;switch&nbsp;&rarr;&nbsp;R828D&nbsp;&rarr;&nbsp;transformer&nbsp;&rarr;&nbsp;VGA&nbsp;&rarr;&nbsp;ADC
+  &mdash; <em>no external SAW</em>. The culprit is the R828D's
+  <strong>internal IF filter</strong>: the chroma (vision&nbsp;IF&nbsp;+&nbsp;4.43&nbsp;MHz)
+  rides near the filter's upper passband corner, the highest-group-delay
+  region. That's also <em>why lowering the vision IF helps</em> &mdash; it
+  slides the chroma more centrally into the passband, away from the corner.
+  It was never a "valley"; it's "get the chroma off the filter edge."
+</div>
+
+<p>We confirmed the filter is the mechanism by poking its bandwidth registers
+(R828D R10/R11): narrowing only made it worse (6&nbsp;MHz cut the chroma out
+entirely), and 8&nbsp;MHz &mdash; the widest the chip offers, the default
+&mdash; is already optimal. So the bandwidth registers can't help; the lever
+is purely <strong>IF position</strong>.</p>
 
 <div class="card">
-  <strong>Workaround.</strong> Tune one MHz low &mdash;
-  <code>--frequency 590700000</code> &mdash; to land the chroma sideband in a
-  flatter "valley" of the SAW's group-delay curve. ~5&times; less trail, no DSP
-  changes, signal still strong. Register pokes into the R828D were tried and
-  came up inconclusive (and register 0x0A is genuinely dangerous &mdash; a
-  bad write needs a physical replug to recover).
+  <strong>The fix &mdash; and beating the trade-off.</strong> Tuning low
+  (<code>--frequency 590200000</code>, vision IF&nbsp;&asymp;&nbsp;3.6&nbsp;MHz)
+  centres the chroma in the passband and all but removes the trail. That used
+  to cost <em>grain</em> &mdash; the signal is hotter at the low IF, so gain
+  had to be backed off. The cure is a <strong>front-end-heavy gain split</strong>:
+  push the LNA up and the IF VGA down (<code>--vhf-lna 28 --vhf-vga 4</code>)
+  for a better noise figure. That gave grain&nbsp;1.37 vs&nbsp;2.71 for a
+  balanced split at the same IF &mdash; <strong>low trail and low grain
+  together</strong>, no DSP changes.
 </div>
 
 <h2 id="status">6. What works, what doesn't</h2>
@@ -340,18 +355,24 @@ gone, which corroborates: it's the tuner, not the console and not our code.</p>
     <tr><td>BBC Micro &mdash; colour</td><td><span class="tag bad">no</span> weak-signal sync defeats it</td></tr>
     <tr><td><code>rx888_stream</code> <em>without</em> PR&nbsp;#16</td><td><span class="tag bad">no</span> wandering carrier, no picture</td></tr>
     <tr><td>HF + AM broadcast (wire antenna)</td><td><span class="tag ok">works</span></td></tr>
-    <tr><td>Heart-trail past coloured sprites</td><td><span class="tag warn">mitigated</span> ~5&times; reduced by IF-tune workaround</td></tr>
+    <tr><td>Heart-trail past coloured sprites</td><td><span class="tag ok">cracked</span> low trail + low grain via IF 3.6 MHz + front-end-heavy gain</td></tr>
+    <tr><td>Capture sample rate 24&ndash;64 MSps</td><td><span class="tag ok">works</span> decoder filters now scale with <code>fs</code> (was 24M-only)</td></tr>
+    <tr><td>Vendor (RaspSDR) native driver as capture base</td><td><span class="tag ok">validated</span> decodes via the same pipeline; reports PLL lock; far more reliable for repeated captures</td></tr>
   </tbody>
 </table>
 
 <h3>The recipe, in one block</h3>
 <pre><code># capture (5 s is plenty for several frames)
+# IF ~3.6 MHz (chroma centred -> least trail) + front-end-heavy gain (least grain)
 rx888_stream vhf -f SDDC_FX3_v22.img -s 24000000 \
-    --frequency 590700000 --vhf-lna 14 --vhf-vga 8 --gain 1 \
+    --frequency 590200000 --vhf-lna 28 --vhf-vga 4 --gain 1 \
     -o cap.bin
 
+# find the exact vision carrier (auto: vision/chroma peak pair, 4.4336 MHz apart)
+python3 tools/analyze_rx888.py cap.bin 24e6
+
 # demod to baseband CVBS (keep chroma for colour)
-python3 tools/demod_real.py cap.bin cvbs.s16 --fs 24e6 --lpf 5.5e6
+python3 tools/demod_real.py cap.bin cvbs.s16 --fs 24e6 --carrier &lt;from above&gt; --lpf 5.5e6
 
 # decode to a colour frame
 python3 tools/cvbs_decode.py cvbs.s16 frame.png \
@@ -359,20 +380,35 @@ python3 tools/cvbs_decode.py cvbs.s16 frame.png \
 
 <h2 id="next">7. Where this goes next</h2>
 <ul>
-  <li><strong>A different tuner.</strong> Non-RX888 hardware was on its way at
-  the close of the investigation &mdash; the cleanest test of the SAW-trail
-  theory is to swap the tuner and watch the trail go.</li>
-  <li><strong>Three-way comparison:</strong> RX888 decode vs a real PAL TV vs
-  the SMS-on-the-tuner, side by side off the same RF feed.</li>
-  <li><strong>Characterise the R828D SAW</strong> directly with a wideband
-  chirp, then design an inverse group-delay filter to flatten it in software.</li>
+  <li><strong>Move to the vendor's native driver.</strong>
+  <code>RaspSDR/rx888</code> (the hardware vendor's own Rust <code>sddc</code>
+  library, C-FFI, cross-platform) decodes through this same pipeline at
+  comparable quality, <em>reports PLL lock</em>, and is far more reliable for
+  repeated captures than the SDDC <code>rx888_stream</code> path &mdash; the
+  natural base for a graduated project.</li>
+  <li><strong>Full interlace.</strong> The decoder currently renders a
+  <em>single field</em> (287 active lines) and line-doubles it vertically, so
+  vertical resolution is half of true PAL and the picture is a touch soft.
+  Merging both fields with the correct half-line offset is the next quality
+  step (earlier full-interlace attempts showed doubled-text from inter-field
+  jitter &mdash; needs per-field horizontal alignment).</li>
+  <li><strong>Black-level clamp &amp; residual grain.</strong> Borders aren't
+  jet-black (raised black level in the percentile normalisation) and flat
+  areas still carry mild grain &mdash; a proper back-porch clamp and a touch
+  more front-end gain / oversampling should help.</li>
   <li><strong>A C++ real-time port</strong> &mdash; the Python streaming demod
   (<code>demod_stream.py</code>) runs at 0.42&times; realtime and is structured
-  as the architecture sketch for it.</li>
+  as the architecture sketch; the vendor lib's C ABI is the natural feed.</li>
   <li><strong>Sync separator hardening</strong> (Schmitt trigger + H-sync PLL)
   to make the weak BBC Micro signal decodable.</li>
-  <li><strong>Full interlace</strong> instead of the current single-field
-  vertical doubling.</li>
+  <li><strong>FX3 multi-capture reliability</strong> &mdash; the second
+  back-to-back <code>-f</code> capture still tends to wedge the chip; tracked
+  down properly it would make capture-heavy experiments painless (or just use
+  the vendor driver, which doesn't have the issue).</li>
+  <li><strong>A different tuner / three-way comparison:</strong> RX888 vs a
+  real PAL TV vs another tuner off the same RF feed &mdash; the trail is the
+  R828D's IF filter, so a different front-end is the way to remove it at the
+  hardware level rather than dodging it via IF placement.</li>
 </ul>
 
 <footer>
