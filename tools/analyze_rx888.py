@@ -14,8 +14,9 @@ with open(path, "rb") as f:
     f.seek(skip * 2)
     raw = f.read(n * 2)
 x = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+clip = (np.abs(x) > 32000).mean() * 100.0
 print(f"loaded {len(x)} samples; mean={x.mean():.1f} std={x.std():.1f} "
-      f"min={x.min():.0f} max={x.max():.0f}")
+      f"min={x.min():.0f} max={x.max():.0f} clip(>32000)={clip:.3f}%")
 
 # Welch-style PSD via averaged periodograms (cheap, no scipy needed).
 seg = 1 << 16        # 65536-bin FFT  -> ~763 Hz bins @ 50 Msps
@@ -48,6 +49,19 @@ for idx in order:
     shown += 1
     if shown >= 12:
         break
+
+# PAL vision/chroma pair: vision carrier and chroma subcarrier sit
+# fSC = 4.43361875 MHz apart. Look for a pair of strong peaks with that
+# spacing — the lower one is the vision carrier (what demod_real --carrier
+# wants). More reliable than "strongest peak", which is chroma on colourful
+# content and vision on sparse content.
+FSC = 4.43361875
+pairs = [(lo, hi) for lo in taken for hi in taken if abs(hi - lo - FSC) < 0.15]
+if pairs:
+    lo, hi = min(pairs, key=lambda p: abs(p[1] - p[0] - FSC))
+    print(f"\nPAL vision/chroma pair found ({FSC:.4f} MHz apart):")
+    print(f"  vision carrier ~ {lo:.4f} MHz   (chroma at {hi:.4f} MHz)")
+    print(f"  -> demod_real.py --carrier {lo*1e6:.0f}")
 
 # Crude ASCII spectrum: downsample to ~100 bins for the printout.
 print("\nCoarse spectrum (linear bins across 0..fs/2):")

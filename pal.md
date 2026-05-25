@@ -840,6 +840,24 @@ artifact is something else.
 
 ### Type B: SMS heart-trail (UNSOLVED in software)
 
+> **Correction (later session): it is NOT a SAW.** Earlier text below
+> calls the culprit a "SAW filter." The RX888 mk2 VHF chain is
+> `LPF → PE4259 switch → R828D → transformer → AD8370 VGA → ADC` — there
+> is **no external SAW**. The group-delay trail is the R828D tuner's
+> **internal IF filter**, which is **register-configurable** (Rafael Micro
+> R820T2/R828D registers **R10/R11 = 0x0A/0x0B**: coarse IF bandwidth
+> narrow/mid/large, a fine-tune 0–15, and a high-pass corner 0–15).
+> Datasheets: the R820T2 Register Description PDF (superkuh.com), the
+> R820T datasheet (rtl-sdr.com); librtlsdr's `tuner_r82xx.c` is the
+> de-facto driver. Note the vendor firmware comment "ADC sampling
+> frequency will change IF filter selection" — **sample rate reselects the
+> IF filter**, so different `fs` can mean different group delay. The
+> filter can be *configured* (move bandwidth / HP-LP corners / IF centre)
+> but not *bypassed* (the tuner IF must pass through the chip). Raw
+> register pokes need our SDDC custom firmware's `--r82xx-write`
+> (`R82XX_I2C_WRITE`); the stock and vendor firmwares don't expose them.
+> Read "SAW" below as "R828D internal IF filter."
+
 **Symptom.** The red SMS heart sprite has a ~20-column blue tail
 extending past its right edge. The trail's peak is ~30% of the
 heart's own chroma magnitude; it decays gradually.
@@ -1228,6 +1246,107 @@ per-call overhead and fusing the mix+filter+envelope into a single
 loop — numpy already uses SIMD via libmvec/BLAS, so the gain isn't
 SIMD-vs-no-SIMD but eliminating numpy bookkeeping and intermediate
 buffers.
+
+## The RX888 vendor driver (RaspSDR/rx888) — a better capture base
+
+Everything above uses `rhgndf/rx888_stream` (an individual's Rust CLI) on
+the SDDC FX3 firmware. There is a more authoritative option: **the
+hardware vendor's own driver**, `github.com/RaspSDR/rx888` (org "SDDC
+Lab", `rx-888.com`; crate name `sddc`). Its README calls the Cypress/SDDC
+approach "deprecated" and itself "the modern replacement." We spiked it
+and it works well.
+
+**What it is.** A native-Rust driver built as a **library with C FFI**
+(`cdylib`/`staticlib`, cbindgen), cross-platform (`nusb` + tokio),
+librtlsdr-style API. Ships its own FX3 firmware (`RX888_FW.img`,
+**embedded via `include_bytes!` and auto-flashed** on `Radio::open()`).
+Different firmware protocol from SDDC: **register-based**, post-flash USB
+PID `04b4:3ddc` (bootloader still `00f3`). A **replug reverts** to the
+bootloader and the SDDC firmware; running any `sddc` tool re-flashes the
+vendor firmware. None of our SDDC PRs (#16/#18/#19/#20) apply to it.
+
+**Why it's the better base.** Vendor-maintained; cross-platform library
+with a C ABI (the natural feed for a future real-time C++/Rust decoder);
+**gains in dB**; and crucially `get_tuner_status() -> (pll_locked,
+harmonic)` — it **reports PLL lock**, exactly the signal we lacked
+through the entire TUNERINIT saga. PLL locks 100 % across 585–596 MHz
+(non-harmonic, ~4 ms) so UHF Ch 36 is well covered.
+
+**Quality result.** A tuner-mode capture at 24 MSps, demodulated and
+decoded by our **unchanged** `demod_real.py` + `cvbs_decode.py`, produces
+a clean colour Wonder Boy III frame — a blind reviewer scored it **7/10,
+"good-quality decode in absolute terms,"** with no chroma trailing even
+on a chroma-dense brick scene, comparable to the SDDC path on
+sharpness/colour/trailing. The decode pipeline is downstream of the raw
+`cap.bin`, so it carries over with **only the ~30-line capture step**
+changing.
+
+**Gain gotcha (cost real time).** In **tuner mode the gains are
+POSITIVE** — RF steps `0..49.6 dB`, IF steps `−4.7..40.8 dB` (see
+`src/gain/rx888r2.rs`). But `get_rf_gain_range()`/`get_if_gain_range()`
+return the **HF/direct-sampling** table (negative, e.g. `(-31.5, 0)`) if
+called *before* `set_direct_sampling(false)`. So `rf_gain=0` in tuner
+mode is **minimum** gain, not max. Capturing at rf=0 gave a ~17 dB-low,
+speckly image (an early review scored that 4/10). Set positive tuner
+gains and SNR matches SDDC (~80 dB).
+
+**IF placement (same SAW physics as above).** Empirically for this SMS,
+`vision_IF = center_freq − 591.05 MHz`. Landing vision at **IF ≈ 3.6 MHz**
+(center ≈ 594.65 MHz) puts chroma in the R828D SAW group-delay valley and
+removes the trail — same trick as the SDDC IF sweep. The SAW response
+*peaks* there, though, so gain must come down to avoid clipping:
+`--rf-gain 12 --if-gain 12` gives raw std ~7000 with no clip, whereas
+`rf=25 if=14` (fine at IF 4.1) rails the ADC at IF 3.6 and breaks sync.
+The SAW trail is hardware — no driver fixes it; IF placement only.
+
+**Reproduce.** Clone `RaspSDR/rx888`, `cargo build --release`. The
+example `capture_raw_data` is HF-only; a small tuner-mode capture bin
+(set `direct_sampling(false)`, `xtal_freq`, `center_freq`, dB gains,
+`read_async` → file) is all that's needed. Add a udev rule for PID
+`04b4:3ddc` (don't run the binary as root). Remaining gap at 7/10 is
+decoder-side **framing** (active picture fills ~81 % width, off-centre)
+and mild flat-area speckle — both `cvbs_decode` tuning, not capture.
+
+**Decoder bug fixed: FIR taps must scale with `fs`.** `cvbs_decode.py`
+had hardcoded FIR lengths (sync LPF 33, Y/C filters 65) tuned for
+24 MSps. At higher sample rates the same Hz cutoffs sit at a lower
+fraction of Nyquist, so a fixed-length FIR can't realise them — the
+narrow chroma BPF collapses and the decode turns to **confetti** (seen at
+64 MSps; sync/line metadata still looked correct, which is what made it
+confusing — the breakage is purely in the filters, not the timing). Fix:
+a `taps_for(ref_at_24m)` helper that scales tap counts with `fs`. After
+it, a sample-rate sweep all decodes cleanly:
+
+| `fs` | grain (border-patch std) |
+|------|--------------------------|
+| 24 MHz | 2.71 |
+| 32 MHz | 2.56 |
+| 48 MHz | 2.32 |
+| 64 MHz | 2.33 |
+
+So **higher `fs` gives slightly less grain** (oversampling processing
+gain — wideband noise spread over a wider band, then the video LPF keeps
+less of it). 64 MSps is a good operating point (and matches what the
+Windows side used for the first successes). Two analysis tools were added
+alongside: `analyze_rx888.py` now prints clip % and auto-finds the
+vision/chroma pair (two peaks 4.4336 MHz apart → the lower is the vision
+carrier, with the exact `--carrier` value); `image_grain.py` reports the
+flat-patch std used as the grain metric above.
+
+**Note on capture duds:** occasional captures come out ~10× low-level
+(e.g. raw std ~780 vs ~7000) for identical settings — likely a blank
+attract-mode screen (mostly-white = low carrier in negative modulation)
+rather than a gain bug. Check raw std (or clip %) after a capture and
+re-shoot if it's a dud before drawing conclusions.
+
+**Graduation plan** (when this spike becomes its own project, e.g.
+`rx888-pal`): (0) scaffold a repo with a single `Makefile`; (1) promote
+the tuner-mode capture into a proper tool against the `sddc` lib/C-FFI
+that asserts `get_tuner_status()` lock before capturing; (2) characterise
+the vendor path (gain-curve map, matched-IF SAW-trail comparison, fix the
+active-area/centring); (3) decoder integration (offline Python now,
+real-time C++/Rust later, fed via the C ABI); (4) README + consider
+contributing a documented tuner-mode example back upstream.
 
 ## Open follow-ups
 

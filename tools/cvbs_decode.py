@@ -127,8 +127,19 @@ print(f"fSC = {fSC/1e6:.6f} MHz | Y/C mode: {args.yc_mode}"
       f"{' | MONO' if args.mono else ''}", flush=True)
 
 
+# FIR tap counts are specified at the 24 MHz reference rate and scaled with
+# fs so every filter keeps the same Hz-domain transition width regardless of
+# sample rate. Without this, a higher fs makes each fixed-length FIR span a
+# narrower fraction of Nyquist — the chroma BPF in particular becomes
+# unrealisable and Y/C separation collapses into noise (seen at 64 MSps).
+def taps_for(ref_taps_at_24m):
+    n = int(round(ref_taps_at_24m * fs / 24e6))
+    n = max(n, ref_taps_at_24m)        # never fewer than the reference
+    return n if n % 2 else n + 1       # force odd (type-I linear phase)
+
+
 # ----- 2. sync separator -----
-sync_filter_lpf = firwin(33, 1.0e6 / (fs/2), window='hamming').astype(np.float32)
+sync_filter_lpf = firwin(taps_for(33), 1.0e6 / (fs/2), window='hamming').astype(np.float32)
 x_for_sync = oaconvolve(x, sync_filter_lpf, mode='same').astype(np.float32)
 sync_tip = float(np.percentile(x_for_sync, 0.5))
 black    = float(np.percentile(x_for_sync, 30.0))
@@ -206,7 +217,7 @@ print(f"measured line period: {line_samp_measured} samples = "
 
 
 # ----- 3. Y/C separation -----
-NTAP = 65
+NTAP = taps_for(65)
 uv_lpf   = firwin(NTAP, 1.5e6 / (fs/2), window='hamming').astype(np.float32)
 luma_lpf = firwin(NTAP, 3.0e6 / (fs/2), window='hamming').astype(np.float32)
 
