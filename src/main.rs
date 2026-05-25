@@ -127,6 +127,13 @@ enum Commands {
         /// Tuner harmonic
         #[arg(long, display_order = 100, default_value_t = 0, value_parser = value_parser!(u8).range(0..=1))]
         vhf_harmonic: u8,
+
+        /// Direct R82XX I2C register writes, applied AFTER tune-time settings.
+        /// Format: REG=VAL[,REG=VAL...] with hex values (e.g. 0x1d=0x18,0x1a=0x00).
+        /// Requires firmware with R82XX_I2C_WRITE vendor command
+        /// (use SDDC_FX3_rebuild.img or SDDC_FX3_analog.img, NOT the stock v22).
+        #[arg(long, display_order = 100)]
+        r82xx_write: Option<String>,
     },
 }
 
@@ -333,7 +340,8 @@ fn main() {
             vhf_lna,
             vhf_vga,
             vhf_sideband,
-            vhf_harmonic
+            vhf_harmonic,
+            r82xx_write,
         }) => {
             gpio |= GPIOPin::VHF_EN as u32;
 
@@ -356,6 +364,41 @@ fn main() {
                 .expect("Could not set R82XX_SIDEBAND");
             rx888_send_argument(&handle, ArgumentList::R82XX_HARMONIC, vhf_harmonic as u16)
                 .expect("Could not set R82XX_HARMONIC");
+
+            // Apply direct R82XX register writes AFTER the tune-time writes,
+            // so they actually stick (the tune sequence may rewrite some
+            // registers itself).
+            if let Some(spec) = r82xx_write {
+                for entry in spec.split(',') {
+                    let entry = entry.trim();
+                    if entry.is_empty() { continue; }
+                    let (reg_s, val_s) = entry.split_once('=')
+                        .unwrap_or_else(|| panic!("--r82xx-write entry must be REG=VAL, got {:?}", entry));
+                    let parse_byte = |s: &str| {
+                        let s = s.trim();
+                        let (radix, digits) = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                            (16, rest)
+                        } else { (10, s) };
+                        u8::from_str_radix(digits, radix)
+                            .unwrap_or_else(|_| panic!("bad byte in --r82xx-write: {:?}", s))
+                    };
+                    let reg = parse_byte(reg_s);
+                    let val = parse_byte(val_s);
+                    // Two known packings used in different SDDC firmware variants:
+                    //   (reg<<8) | val  — high byte = register, low byte = value
+                    //   (val<<8) | reg  — opposite (matches USB little-endian byte order)
+                    // Switch via env var RX888_POKE_SWAP=1
+                    let swap = std::env::var("RX888_POKE_SWAP").map(|v| v == "1").unwrap_or(false);
+                    let packed = if swap {
+                        ((val as u16) << 8) | (reg as u16)
+                    } else {
+                        ((reg as u16) << 8) | (val as u16)
+                    };
+                    eprintln!("R82XX I2C write: reg 0x{:02x} = 0x{:02x} (packed wValue=0x{:04x})", reg, val, packed);
+                    rx888_send_argument(&handle, ArgumentList::R82XX_I2C_WRITE, packed)
+                        .expect("Could not send R82XX_I2C_WRITE");
+                }
+            }
 
             attenuation = 20;
         }

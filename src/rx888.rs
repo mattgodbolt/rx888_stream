@@ -98,6 +98,13 @@ pub enum ArgumentList {
     // value: 0/1
     R82XX_HARMONIC = 4,
 
+    // Direct R82XX I2C register write (debug / experimentation).
+    // value: high byte = register address, low byte = data byte.
+    // Only supported on custom firmwares: SDDC_FX3_rebuild.img,
+    // SDDC_FX3_analog.img. Stock SDDC_FX3_v22.img will ignore or
+    // error on this argument.
+    R82XX_I2C_WRITE = 5,
+
     // Set DAT-31 Att
     // Value: 0-63
     DAT31_ATT = 10,

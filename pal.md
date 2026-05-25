@@ -20,7 +20,7 @@ for any PAL B/G/I source.
   `github.com/fventuri/SDDC_FX3`, or the existing `SDDC_FX3.img` in
   this tree — both work identically for capture.
 - **Capture:** `rx888_stream vhf -f SDDC_FX3_v22.img -s 24000000
-  --frequency 591200000 --vhf-lna 14 --vhf-vga 8 --gain 1
+  --frequency 590700000 --vhf-lna 14 --vhf-vga 8 --gain 1
   -o cap.bin`
 - **Demod:** `tools/demod_real.py cap.bin cvbs.s16 --fs 24e6` (or
   `--lpf 5.5e6` to preserve chroma for colour decoding)
@@ -134,7 +134,7 @@ gcc-arm-none-eabi is the only extra cross-compile dependency needed.
 ./target/release/rx888_stream vhf \
     -f ./SDDC_FX3_v22.img \
     -s 24000000 \
-    --frequency 591200000 \
+    --frequency 590700000 \
     --vhf-lna 14 --vhf-vga 8 --gain 1 \
     -o /tmp/cap.bin
 ```
@@ -144,10 +144,15 @@ Run it for a few seconds, then Ctrl-C. `cap.bin` is raw int16 LE,
 
 Notes on the parameters:
 
-- `--frequency 591200000` — UK PAL Ch 36 vision carrier nominal is
+- `--frequency 590700000` — UK PAL Ch 36 vision carrier nominal is
   591.25 MHz, but consumer modulators run slightly slow; the SMS
-  observed at 591.2 MHz. Tune to wherever your vision carrier actually
-  is.
+  observed at 591.2 MHz. We deliberately tune ~0.5 MHz *below* the
+  vision carrier so the chroma sideband lands on a flatter section of
+  the R828D's SAW group-delay curve — this gives ~5× less chroma
+  trail past coloured sprites than tuning to 591.2 MHz exactly. See
+  "Chroma echoes / trailing artifacts" for the experimental data.
+  Tune to wherever your vision carrier actually is, then subtract
+  0.5 MHz.
 - `--vhf-lna 14 --vhf-vga 8 --gain 1` — gain combo that delivers good
   signal level without ADC clipping. With `--vhf-lna 28 --gain 8` the
   ADC clips at ~94% on a strong source; backing off avoids that.
@@ -160,7 +165,7 @@ committing to a file:
 
 ```bash
 ./target/release/rx888_stream vhf -f ./SDDC_FX3_v22.img \
-    -s 24000000 --frequency 591200000 \
+    -s 24000000 --frequency 590700000 \
     --vhf-lna 14 --vhf-vga 8 --gain 1 -o - \
   | python3 tools/live_scope.py --source stdin --fs 24e6
 ```
@@ -900,15 +905,72 @@ chroma sideband, NOT amplitude rolloff — chroma amplitude was
 similar across positions; only the trail behaviour after sharp
 edges varied).
 
-**Possible software mitigations** (none implemented yet):
+**Practical workaround (Day 5): re-tune to land chroma on a flatter
+section of the SAW response.** A 5-point IF sweep was run by varying
+`--frequency` while the SMS stayed plugged in:
+
+| `--frequency` | Vision IF | Trail B-energy past red sprite |
+|---------------|-----------|--------------------------------|
+| 591.2 MHz (default) | 4.59 MHz | 4975 |
+| 590.7 MHz | 4.10 MHz | **364** (5× cleaner than default) |
+| 590.2 MHz | 3.60 MHz | 0 (cleanest in sweep) |
+| 589.2 MHz | 2.60 MHz | 15228 (3× the default — terrible) |
+| 591.7 MHz | 5.10 MHz | 1560 |
+
+The R828D SAW's group-delay curve has a "valley" around chroma IF ≈
+8.5 MHz (which corresponds to vision IF ≈ 4.0–4.1 MHz). Tuning a
+**single MHz lower than the default** lands chroma in that valley
+and dramatically reduces the trail without any DSP changes.
+
+**Recommendation: change the default `--frequency` from 591.2 MHz
+to 590.7 MHz** for SMS captures. The signal is still strong (vision
+peak 1246 in `burst_mag` vs 1228 at default) but the trail past
+coloured sprites is ~5× weaker.
+
+**Possible additional software mitigations** (none implemented yet):
 - **Inverse group-delay filter on the IF** in `demod_real.py`.
-  Requires measuring the R828D SAW's group-delay curve (e.g. by
-  capturing a wideband chirp through the same setup) and designing
-  an FIR/IIR that pre-distorts to flatten it.
+  Requires measuring the R828D SAW's group-delay curve directly
+  (e.g. by capturing a wideband chirp through the same setup) and
+  designing an FIR/IIR that pre-distorts to flatten it.
 - **Per-frequency phase compensation in chroma demod.** If the
   chroma's group delay is known, a constant phase offset to
   per-line ψ would correct the average misregistration but not the
   trail itself.
+
+### R828D register-poke experiments (Day 5 evening) — inconclusive
+
+Restored the `--r82xx-write REG=VAL` flag from stash (requires
+`SDDC_FX3_rebuild.img` firmware which exposes the
+`R82XX_I2C_WRITE = 5` vendor command). Tried to find a tuner
+register that would change the SAW/IF-filter group-delay curve and
+clean up the trail at default tuning.
+
+Findings:
+- **Register 0x0A is dangerous to poke with full mask.** Its low 4
+  bits hold the *filter calibration code* and bit 4 is the *filter Q*
+  selector. The driver writes them with a partial mask (`0x1F`); a
+  full-mask poke wipes the calibration and pushes the IF chain into
+  garbage (vision shifted from 4.59 to 8.88 MHz with weak signal,
+  regardless of the value written). Don't touch 0x0A without using
+  the partial-mask `r82xx_write_reg_mask` interface.
+- **The firmware already runs `r82xx_set_bandwidth(8 MHz)`** during
+  init (USBhandler.c:139), so we're at the widest pre-canned IF
+  filter already. No "make it wider" knob exists in the chip.
+- **Captures aren't independent across pokes** because the chip's
+  register state persists across rx888_stream invocations (the
+  `--firmware` reset path locks up after first load; subsequent runs
+  must skip it). One bad poke (`0x0a=0x00, 0x0b=0x00`) corrupted the
+  chip so badly it needed a physical replug to recover. Same
+  "no-poke" baseline showed wildly different amplitudes (max-abs
+  varying 684 → 8939 → 994 between successive captures with
+  identical CLI args).
+- **No clean improvement found via register pokes.** The IF-tuning
+  workaround above remains the only verified mitigation.
+
+For a C++ port doing this for real: add a proper `R82XX_BANDWIDTH`
+vendor command that calls the driver's `r82xx_set_bandwidth()`
+function with the right masks, rather than exposing raw register
+writes. Raw writes are too easy to mis-use.
 
 **Hardware mitigations** (with access to the device):
 - Try a different SDR + tuner combination.
