@@ -1267,16 +1267,29 @@ buffers.
        `stopfx3=Ok`; before, it was killed with no `STOPFX3`.
   Immediate workaround if running an old binary: `timeout -s INT N …`
   (SIGINT *is* caught).
-  **Still open — a SEPARATE flakiness:** `-f` firmware reload
-  intermittently times out at `STARTFX3` regardless of how the previous
-  run ended (and the device sometimes re-enumerates 00f1→00f3 on its
-  own between runs). Prime suspect is the fixed `thread::sleep(1000ms)`
-  after `fx3_load_ram` (`main.rs`) racing the FX3's re-enumeration —
-  should be a poll-until-ready instead. Recover meanwhile via sysfs
-  (`SYS=$(for d in /sys/bus/usb/devices/*/; do [ "$(cat $d/idVendor
-  2>/dev/null)" = 04b4 ] && echo $d; done); echo 0 | sudo tee
-  ${SYS}authorized; sleep 1; echo 1 | sudo tee ${SYS}authorized`) or a
-  physical replug.
+  **STARTFX3-reload flakiness — mitigated.** Separately, `-f` firmware
+  reload could intermittently time out at `STARTFX3`. Three changes make
+  this self-recovering for normal use:
+    1. Startup no longer panics if a wedged firmware-mode device won't
+       ack `RESETFX3` — it forces a USB-level `handle.reset()` (the
+       libusb equivalent of a replug), so a wedged device heals on the
+       next `-f` run without a physical unplug.
+    2. The fixed `thread::sleep(1000ms)` after `fx3_load_ram` is gone;
+       the firmware-mode device is polled for (3 s) instead, and the
+       enumeration poll no longer busy-spins.
+    3. `STARTFX3` is retried up to 5× (200 ms apart) — clears the case
+       where the freshly-reloaded firmware's command loop isn't ready.
+  Verified: with realistic (~3 s) spacing between captures, repeated
+  `-f` runs stream reliably with no manual intervention.
+  **Remaining caveat:** firing captures *back-to-back within
+  milliseconds* (e.g. a tight scripted loop) can still wedge the FX3 at
+  a depth the `STARTFX3` retry can't clear (`Timeout` then repeated
+  `Io`) — the chip needs a moment to settle after a stop. If that
+  happens, USB-reset it via sysfs (`SYS=$(for d in
+  /sys/bus/usb/devices/*/; do [ "$(cat $d/idVendor 2>/dev/null)" = 04b4
+  ] && echo $d; done); echo 0 | sudo tee ${SYS}authorized; sleep 1; echo
+  1 | sudo tee ${SYS}authorized`) or replug. Add a short sleep between
+  scripted captures to avoid it.
 - **Colour decoder** — v8 supersedes v7 and produces correct
   primaries on the `hacktv` synthetic test source. Per-line hue
   drift seen in v7 is resolved (root cause was an off-by-23-kHz
