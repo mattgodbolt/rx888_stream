@@ -955,7 +955,35 @@ coloured sprites is ~5× weaker.
   per-line ψ would correct the average misregistration but not the
   trail itself.
 
-### R828D register-poke experiments — inconclusive
+### IF-filter bandwidth pokes — can't beat the 8 MHz default (later session)
+
+Revisited this with the R820T2/R828D register map in hand (`r82xx_set_bandwidth`
+in `tuner_r82xx.c`). The IF filter is reg 0x0A (R10) + 0x0B (R11); the driver's
+own bandwidth presets are `0x0B = 0x0b` (8 MHz), `0x2a` (7 MHz), `0x6b` (6 MHz),
+with reg 0x0A `= 0x10`. Poked **reg 0x0B only** (0x0A's full-byte write wipes the
+filter calibration), each with a fresh `-f` load (without it the I2C write
+`Pipe`-errors — pokes aren't independent across runs):
+
+- **8 MHz (default):** chroma (vision IF + 4.43 MHz) rides near the *upper
+  passband corner* — the highest-group-delay region — which is the trail.
+- **7 MHz:** pulls the corner toward the chroma; chroma survives but no
+  improvement (physics: equal-or-worse group delay at the chroma).
+- **6 MHz:** **cuts the chroma entirely** — confirmed, the 8.5 MHz chroma peak
+  vanished from the spectrum, leaving only the vision carrier.
+
+**Conclusion: 8 MHz (widest) is already optimal; narrowing only hurts. There is
+no register that flattens group delay at the chroma while keeping it in the
+passband.** This reframes the whole trail story: it is the IF filter's
+group-delay edge, and the *only* lever is **IF position** (`--frequency` /
+`center_freq`) — lowering the vision IF slides the chroma more centrally into
+the passband, away from the corner. That is exactly why vision-IF ≈ 3.6 MHz
+gives the cleanest trail (it was never a "SAW valley" — it's "chroma off the
+filter edge"). The remaining trade-off (low-IF = low trail but hotter signal →
+back-off gain → grain) is therefore not register-fixable; the only untested
+lever for the grain is front-end vs IF **gain redistribution** at the low-IF
+position (more LNA/RF, less IF/VGA, for a better noise figure).
+
+### R828D register-poke experiments — inconclusive (earlier session)
 
 Restored the `--r82xx-write REG=VAL` flag from stash (requires
 `SDDC_FX3_rebuild.img` firmware which exposes the
